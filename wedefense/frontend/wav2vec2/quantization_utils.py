@@ -1,0 +1,670 @@
+"""Quantization utilities for WeDefense.
+
+This module provides utility functions for model quantization, including:
+- Model conversion utilities
+- Quantization configuration management
+- Quantization-aware training helpers
+- Model analysis and statistics
+"""
+
+import copy
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import torch
+import torch.nn as nn
+
+from .lsq_quantizer import LSQQuantizer, create_lsq_quantizer
+from .quantized_layers import (
+    QuantizedConv1d,
+    QuantizedLinear,
+    convert_conv1d_to_quantized,
+    convert_linear_to_quantized
+)
+
+
+class QuantizationConfig:
+    """Configuration class for model quantization.
+    
+    This class manages all quantization-related parameters and provides
+    a convenient interface for configuring quantization settings.
+    """
+    
+    def __init__(
+        self,
+        weight_bits: int = 8,
+        activation_bits: int = 8,
+        weight_symmetric: bool = True,
+        activation_symmetric: bool = True,
+        quantize_weights: bool = True,
+        quantize_activations: bool = False,
+        per_channel_weights: bool = True,
+        per_channel_activations: bool = False,
+        exclude_modules: Optional[List[str]] = None,
+        include_modules: Optional[List[str]] = None
+    ):
+        """Initialize quantization configuration.
+        
+        Args:
+            weight_bits: Number of bits for weight quantization
+            activation_bits: Number of bits for activation quantization
+            weight_symmetric: Whether to use symmetric quantization for weights
+            activation_symmetric: Whether to use symmetric quantization for activations
+            quantize_weights: Whether to quantize weights
+            quantize_activations: Whether to quantize activations
+            per_channel_weights: Whether to use per-channel quantization for weights
+            per_channel_activations: Whether to use per-channel quantization for activations
+            exclude_modules: List of module names to exclude from quantization
+            include_modules: List of module names to include in quantization (if None, all are included)
+        """
+        self.weight_bits = weight_bits
+        self.activation_bits = activation_bits
+        self.weight_symmetric = weight_symmetric
+        self.activation_symmetric = activation_symmetric
+        self.quantize_weights = quantize_weights
+        self.quantize_activations = quantize_activations
+        self.per_channel_weights = per_channel_weights
+        self.per_channel_activations = per_channel_activations
+        self.exclude_modules = exclude_modules or []
+        self.include_modules = include_modules
+
+
+def collect_lsq_step_size_params(model: nn.Module) -> List[nn.Parameter]:
+    """Collect all LSQ step_size parameters from a model.
+
+    This searches submodules for 'weight_quantizer' or 'activation_quantizer'
+    that expose a learnable 'step_size' parameter. Returns a de-duplicated list
+    of those Parameters that require gradients.
+
+    Args:
+        model: The model potentially containing LSQ quantizers
+
+    Returns:
+        List of Parameter objects corresponding to LSQ step sizes.
+    """
+    step_params: List[nn.Parameter] = []
+    for module in model.modules():
+        # weight quantizer
+        if hasattr(module, 'weight_quantizer') and module.weight_quantizer is not None:
+            q = module.weight_quantizer
+            if hasattr(q, 'step_size') and q.step_size is not None and isinstance(q.step_size, torch.nn.Parameter):
+                if q.step_size.requires_grad:
+                    step_params.append(q.step_size)
+        # activation quantizer
+        if hasattr(module, 'activation_quantizer') and module.activation_quantizer is not None:
+            q = module.activation_quantizer
+            if hasattr(q, 'step_size') and q.step_size is not None and isinstance(q.step_size, torch.nn.Parameter):
+                if q.step_size.requires_grad:
+                    step_params.append(q.step_size)
+
+    # de-duplicate
+    seen = set()
+    uniq: List[nn.Parameter] = []
+    for p in step_params:
+        pid = id(p)
+        if pid not in seen:
+            uniq.append(p)
+            seen.add(pid)
+    return uniq
+    
+    def should_quantize_module(self, module_name: str) -> bool:
+        """Check if a module should be quantized based on configuration.
+        
+        Args:
+            module_name: Name of the module
+            
+        Returns:
+            True if the module should be quantized
+        """
+        # Check if module is explicitly excluded
+        if any(excluded in module_name for excluded in self.exclude_modules):
+            return False
+        
+        # Check if only specific modules should be included
+        if self.include_modules is not None:
+            return any(included in module_name for included in self.include_modules)
+        
+        return True
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert configuration to dictionary.
+        
+        Returns:
+            Dictionary representation of the configuration
+        """
+        return {
+            'weight_bits': self.weight_bits,
+            'activation_bits': self.activation_bits,
+            'weight_symmetric': self.weight_symmetric,
+            'activation_symmetric': self.activation_symmetric,
+            'quantize_weights': self.quantize_weights,
+            'quantize_activations': self.quantize_activations,
+            'per_channel_weights': self.per_channel_weights,
+            'per_channel_activations': self.per_channel_activations,
+            'exclude_modules': self.exclude_modules,
+            'include_modules': self.include_modules
+        }
+    
+    @classmethod
+    def from_dict(cls, config_dict: Dict[str, Any]) -> 'QuantizationConfig':
+        """Create configuration from dictionary.
+        
+        Args:
+            config_dict: Dictionary containing configuration parameters
+            
+        Returns:
+            QuantizationConfig instance
+        """
+        return cls(**config_dict)
+
+
+def quantize_model(
+    model: nn.Module,
+    config: QuantizationConfig,
+    inplace: bool = False
+) -> nn.Module:
+    """Quantize a model according to the given configuration.
+    
+    Args:
+        model: Model to quantize
+        config: Quantization configuration
+        inplace: Whether to modify the model in-place
+        
+    Returns:
+        Quantized model
+    """
+    if not inplace:
+        model = copy.deepcopy(model)
+    
+    # Convert linear layers
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear) and config.should_quantize_module(name):
+            # Find the parent module and attribute name
+            parent_name = '.'.join(name.split('.')[:-1])
+            attr_name = name.split('.')[-1]
+            
+            if parent_name:
+                parent_module = model
+                for part in parent_name.split('.'):
+                    parent_module = getattr(parent_module, part)
+            else:
+                parent_module = model
+            
+            # Convert to quantized layer
+            quantized_layer = convert_linear_to_quantized(
+                module,
+                weight_bits=config.weight_bits,
+                activation_bits=config.activation_bits,
+                quantize_weights=config.quantize_weights,
+                quantize_activations=config.quantize_activations
+            )
+            
+            setattr(parent_module, attr_name, quantized_layer)
+    
+    # Convert conv1d layers
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Conv1d) and config.should_quantize_module(name):
+            # Find the parent module and attribute name
+            parent_name = '.'.join(name.split('.')[:-1])
+            attr_name = name.split('.')[-1]
+            
+            if parent_name:
+                parent_module = model
+                for part in parent_name.split('.'):
+                    parent_module = getattr(parent_module, part)
+            else:
+                parent_module = model
+            
+            # Convert to quantized layer
+            quantized_layer = convert_conv1d_to_quantized(
+                module,
+                weight_bits=config.weight_bits,
+                activation_bits=config.activation_bits,
+                quantize_weights=config.quantize_weights,
+                quantize_activations=config.quantize_activations
+            )
+            
+            setattr(parent_module, attr_name, quantized_layer)
+    
+    return model
+
+
+def get_quantization_stats(model: nn.Module) -> Dict[str, Any]:
+    """Get quantization statistics for a quantized model.
+    
+    Args:
+        model: Quantized model
+        
+    Returns:
+        Dictionary containing quantization statistics
+    """
+    stats = {
+        'total_parameters': 0,
+        'quantized_parameters': 0,
+        'quantization_errors': {},
+        'effective_bits': {},
+        'quantized_modules': []
+    }
+    
+    for name, module in model.named_modules():
+        if hasattr(module, 'get_quantization_stats'):
+            module_stats = module.get_quantization_stats()
+            stats['quantization_errors'][name] = module_stats.get('weight_quantization_error', 0.0)
+            stats['effective_bits'][name] = module_stats.get('weight_effective_bits', 0.0)
+            stats['quantized_modules'].append(name)
+        
+        # Count parameters
+        for param in module.parameters():
+            stats['total_parameters'] += param.numel()
+            if hasattr(module, 'weight_quantizer') and module.weight_quantizer is not None:
+                stats['quantized_parameters'] += param.numel()
+    
+    return stats
+
+
+def calculate_model_size(model: nn.Module, bits_per_param: int = 32) -> Dict[str, float]:
+    """Calculate model size in different units.
+    
+    Args:
+        model: Model to analyze
+        bits_per_param: Number of bits per parameter (32 for float32, 8 for int8, etc.)
+        
+    Returns:
+        Dictionary containing size information
+    """
+    total_params = sum(p.numel() for p in model.parameters())
+    
+    # Calculate sizes
+    bits = total_params * bits_per_param
+    bytes_size = bits / 8
+    kb_size = bytes_size / 1024
+    mb_size = kb_size / 1024
+    gb_size = mb_size / 1024
+    
+    return {
+        'total_parameters': total_params,
+        'bits': bits,
+        'bytes': bytes_size,
+        'kb': kb_size,
+        'mb': mb_size,
+        'gb': gb_size,
+        'bits_per_param': bits_per_param
+    }
+
+
+def compare_model_sizes(
+    original_model: nn.Module,
+    quantized_model: nn.Module,
+    original_bits: int = 32,
+    quantized_bits: int = 8
+) -> Dict[str, Any]:
+    """Compare sizes between original and quantized models.
+    
+    Args:
+        original_model: Original model
+        quantized_model: Quantized model
+        original_bits: Bits per parameter in original model
+        quantized_bits: Bits per parameter in quantized model
+        
+    Returns:
+        Dictionary containing comparison statistics
+    """
+    original_size = calculate_model_size(original_model, original_bits)
+    quantized_size = calculate_model_size(quantized_model, quantized_bits)
+    
+    compression_ratio = original_size['mb'] / quantized_size['mb']
+    size_reduction = (original_size['mb'] - quantized_size['mb']) / original_size['mb']
+    
+    return {
+        'original_size_mb': original_size['mb'],
+        'quantized_size_mb': quantized_size['mb'],
+        'compression_ratio': compression_ratio,
+        'size_reduction_percent': size_reduction * 100,
+        'original_parameters': original_size['total_parameters'],
+        'quantized_parameters': quantized_size['total_parameters']
+    }
+
+
+def create_quantization_aware_training_hooks(
+    model: nn.Module,
+    config: QuantizationConfig
+) -> List[torch.utils.hooks.RemovableHandle]:
+    """Create hooks for quantization-aware training.
+    
+    Args:
+        model: Model to add hooks to
+        config: Quantization configuration
+        
+    Returns:
+        List of hook handles that can be removed
+    """
+    hooks = []
+    
+    def quantization_hook(module, input, output):
+        """Hook to apply quantization during forward pass."""
+        if hasattr(module, 'activation_quantizer') and module.activation_quantizer is not None:
+            return module.activation_quantizer(output)
+        return output
+    
+    # Add hooks to modules that have activation quantizers
+    for name, module in model.named_modules():
+        if hasattr(module, 'activation_quantizer') and module.activation_quantizer is not None:
+            hook = module.register_forward_hook(quantization_hook)
+            hooks.append(hook)
+    
+    return hooks
+
+
+def freeze_quantization_parameters(model: nn.Module) -> None:
+    """Freeze quantization parameters (step sizes) to prevent further training.
+    
+    Args:
+        model: Model with quantization parameters to freeze
+    """
+    for module in model.modules():
+        if hasattr(module, 'weight_quantizer') and module.weight_quantizer is not None:
+            if hasattr(module.weight_quantizer, 'step_size') and module.weight_quantizer.step_size is not None:
+                module.weight_quantizer.step_size.requires_grad = False
+        
+        if hasattr(module, 'activation_quantizer') and module.activation_quantizer is not None:
+            if hasattr(module.activation_quantizer, 'step_size') and module.activation_quantizer.step_size is not None:
+                module.activation_quantizer.step_size.requires_grad = False
+
+
+def unfreeze_quantization_parameters(model: nn.Module) -> None:
+    """Unfreeze quantization parameters to allow training.
+    
+    Args:
+        model: Model with quantization parameters to unfreeze
+    """
+    for module in model.modules():
+        if hasattr(module, 'weight_quantizer') and module.weight_quantizer is not None:
+            if hasattr(module.weight_quantizer, 'step_size') and module.weight_quantizer.step_size is not None:
+                module.weight_quantizer.step_size.requires_grad = True
+        
+        if hasattr(module, 'activation_quantizer') and module.activation_quantizer is not None:
+            if hasattr(module.activation_quantizer, 'step_size') and module.activation_quantizer.step_size is not None:
+                module.activation_quantizer.step_size.requires_grad = True
+
+
+def apply_quantization(
+    model: nn.Module, 
+    config: Optional[QuantizationConfig] = None,
+    target_modules: Optional[List[str]] = None,
+    preserve_hp_gating: bool = True
+) -> nn.Module:
+    """Apply quantization to a model, preserving HP framework gating logic.
+    
+    This function converts standard PyTorch layers to quantized versions while
+    preserving the Hard Concrete gating logic used in the HP framework for
+    structured pruning.
+    
+    Args:
+        model: The model to quantize
+        config: Quantization configuration. If None, uses default 8-bit symmetric
+        target_modules: List of module types to quantize. If None, quantizes all supported types
+        preserve_hp_gating: Whether to preserve Hard Concrete gating logic
+        
+    Returns:
+        The quantized model with preserved gating logic
+        
+    Example:
+        >>> from wedefense.frontend.wav2vec2 import wavlm_base, apply_quantization
+        >>> model = wavlm_base()
+        >>> quantized_model = apply_quantization(model, preserve_hp_gating=True)
+    """
+    if config is None:
+        config = QuantizationConfig()
+    
+    if target_modules is None:
+        target_modules = ['Linear', 'Conv1d', 'LayerNorm', 'GroupNorm']
+    
+    # Create a copy of the model to avoid modifying the original
+    quantized_model = copy.deepcopy(model)
+    
+    # Track conversion statistics
+    conversion_stats = {
+        'converted_modules': 0,
+        'preserved_gating': 0,
+        'skipped_modules': 0
+    }
+    
+    def convert_module(module, name=""):
+        """Recursively convert modules to quantized versions."""
+        for child_name, child_module in list(module.named_children()):
+            full_name = f"{name}.{child_name}" if name else child_name
+            
+            # Check if this module should be quantized
+            should_quantize = (
+                child_module.__class__.__name__ in target_modules and
+                not isinstance(child_module, (QuantizedLinear, QuantizedConv1d))
+            )
+            
+            if should_quantize:
+                try:
+                    # Check if module has Hard Concrete gating
+                    has_gating = False
+                    gating_info = {}
+                    
+                    if hasattr(child_module, 'hard_concrete') and child_module.hard_concrete is not None:
+                        has_gating = True
+                        gating_info['hard_concrete'] = child_module.hard_concrete
+                    
+                    if hasattr(child_module, 'hard_concrete_for_heads') and child_module.hard_concrete_for_heads is not None:
+                        has_gating = True
+                        gating_info['hard_concrete_for_heads'] = child_module.hard_concrete_for_heads
+                    
+                    if hasattr(child_module, 'hard_concrete_for_layer') and child_module.hard_concrete_for_layer is not None:
+                        has_gating = True
+                        gating_info['hard_concrete_for_layer'] = child_module.hard_concrete_for_layer
+                    
+                    if hasattr(child_module, 'hard_concrete_for_intermediate') and child_module.hard_concrete_for_intermediate is not None:
+                        has_gating = True
+                        gating_info['hard_concrete_for_intermediate'] = child_module.hard_concrete_for_intermediate
+                    
+                    # Convert to quantized version
+                    if isinstance(child_module, nn.Linear):
+                        quantized_child = convert_linear_to_quantized(
+                            child_module, 
+                            weight_bits=config.weight_bits,
+                            activation_bits=config.activation_bits,
+                            quantize_weights=config.quantize_weights,
+                            quantize_activations=config.quantize_activations
+                        )
+                    elif isinstance(child_module, nn.Conv1d):
+                        quantized_child = convert_conv1d_to_quantized(
+                            child_module,
+                            weight_bits=config.weight_bits,
+                            activation_bits=config.activation_bits,
+                            quantize_weights=config.quantize_weights,
+                            quantize_activations=config.quantize_activations
+                        )
+                    else:
+                        # For LayerNorm/GroupNorm, we don't quantize by default
+                        # as they typically don't benefit from quantization
+                        conversion_stats['skipped_modules'] += 1
+                        convert_module(child_module, full_name)
+                        continue
+                    
+                    # Preserve gating logic if requested
+                    if preserve_hp_gating and has_gating:
+                        for gating_name, gating_module in gating_info.items():
+                            setattr(quantized_child, gating_name, gating_module)
+                        conversion_stats['preserved_gating'] += 1
+                    
+                    # Replace the module
+                    setattr(module, child_name, quantized_child)
+                    conversion_stats['converted_modules'] += 1
+                    
+                except Exception as e:
+                    print(f"Warning: Failed to quantize module {full_name}: {e}")
+                    conversion_stats['skipped_modules'] += 1
+            else:
+                # Recursively process child modules
+                convert_module(child_module, full_name)
+    
+    # Apply quantization
+    convert_module(quantized_model)
+    
+    # Print conversion statistics
+    print(f"Quantization applied successfully:")
+    print(f"  - Converted modules: {conversion_stats['converted_modules']}")
+    print(f"  - Preserved gating: {conversion_stats['preserved_gating']}")
+    print(f"  - Skipped modules: {conversion_stats['skipped_modules']}")
+    
+    return quantized_model
+
+
+def apply_quantization_with_hp_integration(
+    model: nn.Module,
+    config: Optional[QuantizationConfig] = None,
+    enable_pruning: bool = True,
+    pruning_config: Optional[Dict] = None
+) -> nn.Module:
+    """Apply quantization with full HP framework integration.
+    
+    This function applies quantization while preserving the complete HP framework
+    functionality, including Hard Concrete gating, structured pruning, and
+    progressive sparsity scheduling.
+    
+    Args:
+        model: The model to quantize and integrate with HP framework
+        config: Quantization configuration
+        enable_pruning: Whether to enable structured pruning
+        pruning_config: Configuration for pruning (if enabled)
+        
+    Returns:
+        Model with quantization and HP framework integration
+    """
+    if config is None:
+        config = QuantizationConfig()
+    
+    if pruning_config is None:
+        pruning_config = {
+            'target_sparsity': 0.5,
+            'sparsity_warmup_epochs': 7,
+            'sparsity_schedule': 'cosine',
+            'min_sparsity': 0.0
+        }
+    
+    # Step 1: Apply quantization first
+    print("Step 1: Applying quantization...")
+    quantized_model = apply_quantization(model, config, preserve_hp_gating=True)
+    
+    # Step 2: Enable HP framework gating if pruning is enabled
+    if enable_pruning:
+        print("Step 2: Enabling HP framework gating...")
+        _enable_hp_gating(quantized_model, pruning_config)
+    
+    # Step 3: Set up quantization-aware training
+    print("Step 3: Setting up quantization-aware training...")
+    _setup_quantization_training(quantized_model, config)
+    
+    return quantized_model
+
+
+def _enable_hp_gating(model: nn.Module, pruning_config: Dict) -> None:
+    """Enable Hard Concrete gating for structured pruning."""
+    from .hardconcrete import HardConcrete
+    
+    for name, module in model.named_modules():
+        # Enable gating for convolutional layers
+        if hasattr(module, 'conv') and isinstance(module.conv, nn.Conv1d):
+            if not hasattr(module, 'hard_concrete') or module.hard_concrete is None:
+                out_channels = module.conv.out_channels
+                module.hard_concrete = HardConcrete(n_in=out_channels, init_mean=0.01)
+        
+        # Enable gating for attention layers
+        elif hasattr(module, 'remaining_heads') and hasattr(module, 'total_num_heads'):
+            if not hasattr(module, 'hard_concrete_for_heads') or module.hard_concrete_for_heads is None:
+                num_heads = len(module.remaining_heads)
+                module.hard_concrete_for_heads = HardConcrete(n_in=num_heads, init_mean=0.5)
+            
+            if not hasattr(module, 'hard_concrete_for_layer') or module.hard_concrete_for_layer is None:
+                module.hard_concrete_for_layer = HardConcrete(n_in=1, init_mean=0.01)
+        
+        # Enable gating for feed-forward layers
+        elif hasattr(module, 'intermediate_dense') and isinstance(module.intermediate_dense, nn.Linear):
+            if not hasattr(module, 'hard_concrete_for_intermediate') or module.hard_concrete_for_intermediate is None:
+                intermediate_features = module.intermediate_dense.out_features
+                module.hard_concrete_for_intermediate = HardConcrete(n_in=intermediate_features, init_mean=0.5)
+            
+            if not hasattr(module, 'hard_concrete_for_layer') or module.hard_concrete_for_layer is None:
+                module.hard_concrete_for_layer = HardConcrete(n_in=1, init_mean=0.01)
+
+
+def _setup_quantization_training(model: nn.Module, config: QuantizationConfig) -> None:
+    """Set up quantization-aware training parameters."""
+    # Set quantization parameters to trainable
+    unfreeze_quantization_parameters(model)
+    
+    # Set appropriate training modes
+    for module in model.modules():
+        if hasattr(module, 'weight_quantizer') and module.weight_quantizer is not None:
+            module.weight_quantizer.train()
+        
+        if hasattr(module, 'activation_quantizer') and module.activation_quantizer is not None:
+            module.activation_quantizer.train()
+
+
+# Predefined quantization configurations
+QUANTIZATION_CONFIGS = {
+    '8bit_symmetric': QuantizationConfig(
+        weight_bits=8,
+        activation_bits=8,
+        weight_symmetric=True,
+        activation_symmetric=True,
+        quantize_weights=True,
+        quantize_activations=False
+    ),
+    '8bit_asymmetric': QuantizationConfig(
+        weight_bits=8,
+        activation_bits=8,
+        weight_symmetric=False,
+        activation_symmetric=False,
+        quantize_weights=True,
+        quantize_activations=False
+    ),
+    '4bit_symmetric': QuantizationConfig(
+        weight_bits=4,
+        activation_bits=4,
+        weight_symmetric=True,
+        activation_symmetric=True,
+        quantize_weights=True,
+        quantize_activations=False
+    ),
+    'mixed_precision': QuantizationConfig(
+        weight_bits=8,
+        activation_bits=16,
+        weight_symmetric=True,
+        activation_symmetric=True,
+        quantize_weights=True,
+        quantize_activations=True
+    ),
+    'weights_only': QuantizationConfig(
+        weight_bits=8,
+        activation_bits=8,
+        weight_symmetric=True,
+        activation_symmetric=True,
+        quantize_weights=True,
+        quantize_activations=False
+    )
+}
+
+
+def get_quantization_config(config_name: str) -> QuantizationConfig:
+    """Get a predefined quantization configuration.
+    
+    Args:
+        config_name: Name of the configuration
+        
+    Returns:
+        QuantizationConfig instance
+        
+    Raises:
+        ValueError: If config_name is not found
+    """
+    if config_name not in QUANTIZATION_CONFIGS:
+        available_configs = list(QUANTIZATION_CONFIGS.keys())
+        raise ValueError(f"Unknown config '{config_name}'. Available configs: {available_configs}")
+    
+    return QUANTIZATION_CONFIGS[config_name]

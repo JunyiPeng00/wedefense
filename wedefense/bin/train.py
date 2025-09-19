@@ -213,6 +213,22 @@ def train(config='conf/config.yaml', **kwargs):
                 }
             for k, v in prune_defaults.items():
                 configs.setdefault(k, v)
+    
+    # quantization related hyper-parameters
+    use_quantization = configs.get("use_quantization", False)
+    if use_quantization:
+        if rank == 0:
+            logger.info("<== Quantization ==>")
+            logger.info("use quantization")
+            quantization_defaults = {
+                'use_quantization': False,  # disabled by default; enable with --use_quantization True
+                'quantization_config': '8bit_symmetric',  # quantization configuration
+                'quantize_weights': True,  # quantize weights
+                'quantize_activations': False,  # quantize activations
+                'preserve_hp_gating': True,  # preserve HP framework gating
+            }
+            for k, v in quantization_defaults.items():
+                configs.setdefault(k, v)
     # model: frontend (optional) => speaker model => projection layer
     logger.info("<== Model ==>")
     frontend_type = configs['dataset_args'].get('frontend', 'fbank')
@@ -232,6 +248,45 @@ def train(config='conf/config.yaml', **kwargs):
     if rank == 0:
         num_params = sum(param.numel() for param in model.parameters())
         logger.info('speaker_model size: {}'.format(num_params))
+    
+    # Apply quantization if enabled (before loading checkpoint)
+    if use_quantization:
+        if rank == 0:
+            logger.info("Applying quantization to model...")
+        try:
+            from wedefense.frontend.wav2vec2 import apply_quantization_with_hp_integration, get_quantization_config
+            
+            # Get quantization configuration
+            quant_config = get_quantization_config(configs['quantization_config'])
+            if configs.get('quantize_weights', True):
+                quant_config.quantize_weights = True
+            if configs.get('quantize_activations', False):
+                quant_config.quantize_activations = True
+            
+            # Apply quantization with HP integration
+            pruning_config = {
+                'target_sparsity': configs.get('target_sparsity', 0.5),
+                'sparsity_warmup_epochs': configs.get('sparsity_warmup_epochs', 7),
+                'sparsity_schedule': configs.get('sparsity_schedule', 'cosine'),
+                'min_sparsity': configs.get('min_sparsity', 0.0)
+            }
+            
+            model = apply_quantization_with_hp_integration(
+                model, 
+                config=quant_config,
+                enable_pruning=use_pruning,
+                pruning_config=pruning_config
+            )
+            
+            if rank == 0:
+                quantized_params = sum(param.numel() for param in model.parameters())
+                logger.info('Quantized model size: {}'.format(quantized_params))
+                logger.info('Quantization applied successfully!')
+        except Exception as e:
+            if rank == 0:
+                logger.error(f"Failed to apply quantization: {e}")
+                logger.info("Continuing without quantization...")
+    
     # For model_init, only frontend and speaker model are needed !!!
     if configs['model_init'] is not None:
         logger.info('Load initial model from {}'.format(configs['model_init']))
@@ -292,8 +347,11 @@ def train(config='conf/config.yaml', **kwargs):
     logger.info('start_epoch: {}'.format(start_epoch))
 
     # freeze some pretraining-specific parameters
+    # Keep LSQ step_size trainable for quantization
     for name, param in model.named_parameters():
-        if any(k in name for k in ["quantizer", "project_q", "final_proj"]):
+        if any(k in name for k in ["project_q", "final_proj"]) or (
+            ("quantizer" in name) and ("step_size" not in name)
+        ):
             param.requires_grad = False
 
     # ddp_model
@@ -324,9 +382,44 @@ def train(config='conf/config.yaml', **kwargs):
         configs['reg_lr'] = reg_lr 
         configs['lambda_pair'] = lambda_pair
     else:
-        optimizer = getattr(torch.optim,
-                        configs['optimizer'])(ddp_model.parameters(),
-                                              **configs['optimizer_args'])
+        # Baseline optimizer on all params
+        # If quantization is enabled, add a dedicated param group for LSQ step sizes
+        if use_quantization:
+            try:
+                from wedefense.frontend.wav2vec2.quantization_utils import collect_lsq_step_size_params
+                lsq_params = collect_lsq_step_size_params(ddp_model)
+                if len(lsq_params) > 0:
+                    # Exclude LSQ step_size params from main group to avoid duplication
+                    lsq_param_ids = {id(p) for p in lsq_params}
+                    main_params = [p for p in ddp_model.parameters() if id(p) not in lsq_param_ids]
+                    
+                    lsq_lr = configs.get('lsq_lr', configs['optimizer_args']['lr'])
+                    param_groups = [
+                        { 'params': main_params, **{k:v for k,v in configs['optimizer_args'].items() if k != 'lr'}, 'lr': configs['optimizer_args']['lr'], 'name': 'main' },
+                        { 'params': lsq_params, 'lr': lsq_lr, 'weight_decay': 0.0, 'name': 'lsq_step_size' }
+                    ]
+                    if rank == 0:
+                        logger.info(f"Added LSQ step_size param group: {len(lsq_params)} params, lr={lsq_lr}")
+                        logger.info(f"Main param group: {len(main_params)} params, lr={configs['optimizer_args']['lr']}")
+                else:
+                    # No LSQ params found, use all parameters
+                    param_groups = [
+                        { 'params': ddp_model.parameters(), **{k:v for k,v in configs['optimizer_args'].items() if k != 'lr'}, 'lr': configs['optimizer_args']['lr'], 'name': 'main' }
+                    ]
+            except Exception as e:
+                if rank == 0:
+                    logger.warning(f"Could not add LSQ step_size param group: {e}")
+                # Fallback to all parameters
+                param_groups = [
+                    { 'params': ddp_model.parameters(), **{k:v for k,v in configs['optimizer_args'].items() if k != 'lr'}, 'lr': configs['optimizer_args']['lr'], 'name': 'main' }
+                ]
+        else:
+            # No quantization, use all parameters
+            param_groups = [
+                { 'params': ddp_model.parameters(), **{k:v for k,v in configs['optimizer_args'].items() if k != 'lr'}, 'lr': configs['optimizer_args']['lr'], 'name': 'main' }
+            ]
+
+        optimizer = getattr(torch.optim, configs['optimizer'])(param_groups)
     if rank == 0:
         logger.info("<== Optimizer ==>")
         logger.info("optimizer is: " + configs['optimizer'])
