@@ -230,7 +230,8 @@ def train(config='conf/config.yaml', **kwargs):
             for k, v in quantization_defaults.items():
                 configs.setdefault(k, v)
     # model: frontend (optional) => speaker model => projection layer
-    logger.info("<== Model ==>")
+    if rank == 0:
+        logger.info("<== Model ==>")
     frontend_type = configs['dataset_args'].get('frontend', 'fbank')
     configs['original_ssl_num_params'] = 0
     if frontend_type != "fbank" and not frontend_type.startswith('lfcc'):
@@ -292,7 +293,8 @@ def train(config='conf/config.yaml', **kwargs):
         logger.info('Load initial model from {}'.format(configs['model_init']))
         load_checkpoint(model, configs['model_init'])
     elif checkpoint is None:
-        logger.info('Train model from scratch ...')
+        if rank == 0:
+            logger.info('Train model from scratch ...')
     # projection layer
     if (configs['model_args']['embed_dim'] < 0):  # TODO check
         # #if emb_dim <0, we will reduce dim by emb_dim. like -2 will be dim/2
@@ -344,8 +346,9 @@ def train(config='conf/config.yaml', **kwargs):
         logger.info('Load checkpoint: {}'.format(checkpoint))
     else:
         start_epoch = 1
-    logger.info('start_epoch: {}'.format(start_epoch))
-
+    
+    if rank == 0:
+        logger.info('start_epoch: {}'.format(start_epoch))
     # freeze some pretraining-specific parameters
     # Keep LSQ step_size trainable for quantization
     for name, param in model.named_parameters():

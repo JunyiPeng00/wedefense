@@ -50,11 +50,6 @@ from .quantization_utils import (
     apply_quantization_with_hp_integration,
     QUANTIZATION_CONFIGS
 )
-from .quantization_training import (
-    QuantizationAwareTrainer,
-    create_gradual_quantization_schedule,
-    quantize_model_with_gradual_schedule
-)
 
 __all__ = [
     # Core wav2vec2 components
@@ -103,10 +98,5 @@ __all__ = [
     'get_quantization_config',
     'apply_quantization',
     'apply_quantization_with_hp_integration',
-    'QUANTIZATION_CONFIGS',
-    
-    # Quantization training
-    'QuantizationAwareTrainer',
-    'create_gradual_quantization_schedule',
-    'quantize_model_with_gradual_schedule'
+    'QUANTIZATION_CONFIGS'
 ]

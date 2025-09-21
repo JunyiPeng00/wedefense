@@ -15,22 +15,32 @@
 """Frontend for speech feature extraction using Hugging Face pretrained models."""
 
 import contextlib
-import logging
+import os
 from typing import Mapping, Any, Tuple
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 
-from wedefense.frontend.wav2vec2.convert_wavlm_base_from_hf import convert_wavlm
-from wedefense.frontend.wav2vec2.model import wav2vec2_model
+from wedefense.frontend.wav2vec2.convert_hf_ssl_models import convert_hf_ssl_model
+from wedefense.frontend.wav2vec2.model import wav2vec2_model, wavlm_model
 
-# Configure logging
-logger = logging.getLogger(__name__)
-logging.basicConfig(
-    format='[ %(levelname)s : %(asctime)s ] - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-    level=logging.INFO,
-)
+
+def is_rank_zero() -> bool:
+    """Check if current process is rank 0 in distributed training.
+    
+    Returns:
+        True if current process is rank 0 or not in distributed training.
+    """
+    # First check environment variable (for manual testing)
+    rank_env = os.environ.get('RANK')
+    if rank_env is not None:
+        return int(rank_env) == 0
+    
+    # Then check distributed training
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return True  # If not distributed, always log
+    return torch.distributed.get_rank() == 0
 
 
 class HuggingfaceFrontend(nn.Module):
@@ -75,18 +85,18 @@ class HuggingfaceFrontend(nn.Module):
         download_dir = upstream_args['path_or_url']
         self.frozen = frozen
 
-        # 1. If download_dir ends with '.bin', treat it as a pre-converted
+        # 1. If download_dir ends with '.bin' or '.pth', treat it as a pre-converted
         #    model path. Otherwise, download and convert the model.
-        if download_dir.endswith('.bin'):
-            logger.info(
-                f"Path ends with .bin, assuming it is a pre-converted model: {download_dir}"
-            )
+        if download_dir.endswith(('.bin', '.pth')):
+            if is_rank_zero():
+                print(f"Path ends with {download_dir.split('.')[-1]}, assuming it is a pre-converted model: {download_dir}")
             converted_model_path = download_dir
         else:
-            logger.info(f"Starting model download and conversion for {self.upstream_name}.")
-            # This function returns the path to the converted checkpoint.
-            converted_model_path = convert_wavlm(
-                model_size=self.upstream_name,
+            if is_rank_zero():
+                print(f"Starting model download and conversion for {self.upstream_name}.")
+            # This function returns the path to the converted checkpoint and config.
+            converted_model_path, _ = convert_hf_ssl_model(
+                model_name=self.upstream_name,
                 exp_dir=download_dir,
                 hf_cache_dir=download_dir,
                 local_files_only=False,
@@ -127,7 +137,8 @@ class HuggingfaceFrontend(nn.Module):
         ckpt = torch.load(upstream_ckpt_path, map_location='cpu')
         config = ckpt['config']
         pruning_set = set(p.strip() for p in pruning_units.split(',') if p)
-        logger.info(f'Enabled pruning units: {pruning_set}')
+        if is_rank_zero():
+            print(f'Enabled pruning units: {pruning_set}')
 
         config.update({
             'extractor_prune_conv_channels': 'conv' in pruning_set,
@@ -137,13 +148,21 @@ class HuggingfaceFrontend(nn.Module):
             'encoder_prune_feed_forward_layer': 'ffnlayer' in pruning_set,
         })
 
-        model = wav2vec2_model(**config)
+        # Ensure required parameters are present
+        if 'aux_num_out' not in config:
+            config['aux_num_out'] = None
+        if 'normalize_waveform' not in config:
+            config['normalize_waveform'] = False
+
+        # Determine which model class to use based on the model name
+        if "wavlm" in self.upstream_name.lower():
+            model = wavlm_model(**config)
+        else:
+            model = wav2vec2_model(**config)
+        
         result = model.load_state_dict(ckpt['state_dict'], strict=False)
-        logger.info(
-            'Loaded pretrained ckpt to upstream: missing=%s, unexpected=%s',
-            result.missing_keys,
-            result.unexpected_keys,
-        )
+        if is_rank_zero():
+            print(f'[{self.upstream_name}] Loaded pretrained ckpt to upstream: missing={len(result.missing_keys)}, unexpected={len(result.unexpected_keys)}')
         return model, config
 
     def output_size(self) -> int:
@@ -155,6 +174,11 @@ class HuggingfaceFrontend(nn.Module):
         Returns:
             The integer size of the output dimension.
         """
+        # Check if we have config information from the loaded model
+        if hasattr(self, 'upstream_config') and 'encoder_embed_dim' in self.upstream_config:
+            return self.upstream_config['encoder_embed_dim']
+        
+        # Fallback to model name-based logic
         if 'large' in self.upstream_name or 'xlsr' in self.upstream_name:
             return 1024
         if 'base' in self.upstream_name:
@@ -163,6 +187,14 @@ class HuggingfaceFrontend(nn.Module):
             return 1024
         if self.upstream_name == 'xls_r_2b':
             return 1920
+        
+        # For data2vec models
+        if 'data2vec' in self.upstream_name:
+            if 'large' in self.upstream_name:
+                return 1024
+            elif 'base' in self.upstream_name:
+                return 768
+                
         raise ValueError(f'Unknown output size for model: {self.upstream_name}')
 
     def forward(
@@ -206,16 +238,27 @@ class HuggingfaceFrontend(nn.Module):
 
 def main():
     """Instantiates and tests the HuggingfaceFrontend."""
-    # This example config assumes a pre-existing, pruned model checkpoint.
-    # To test the conversion logic, you would typically not provide a
-    # `path_or_url` and let the __init__ method handle it.
+    # Check if we're in distributed training
+    rank = 0
+    world_size = 1
+    if dist.is_available() and dist.is_initialized():
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+    
+    # This example config demonstrates support for various SSL models.
+    # The conversion logic will handle downloading and converting the model.
     upstream_config = {
-        'name': 'wavlm_base_plus',
+        'name': 'hubert_base',  # Can be: hubert_base, wav2vec2_base, wavlm_base, etc.
+        'path_or_url': './hf_models/',  # Directory for model cache
         'pruning_units': '',  # No pruning in this example
     }
-    logger.info('Initializing HuggingfaceFrontend with config: %s', upstream_config)
+    
+    if is_rank_zero():
+        print(f'Initializing HuggingfaceFrontend with config: {upstream_config}')
+        if world_size > 1:
+            print(f'Running in distributed mode: rank={rank}, world_size={world_size}')
 
-    # Note: This will trigger the download and conversion of 'wavlm-base-plus'
+    # Note: This will trigger the download and conversion of the specified model
     # if it's not already present in './hf_models/'.
     net = HuggingfaceFrontend(
         upstream_args=upstream_config, download_dir='./hf_models/'
@@ -224,13 +267,18 @@ def main():
     dummy_input = torch.randn(4, 32000)  # Batch of 4, 2 seconds of audio
     dummy_lengths = torch.LongTensor([32000] * 4)
 
-    logger.info('Model initialized successfully.')
-    logger.info('Number of parameters: %d', net.get_num_params())
-    # print(net)  # Uncomment to see model architecture
+    if is_rank_zero():
+        print('Model initialized successfully.')
+        print(f'Number of parameters: {net.get_num_params():,}')
+        # print(net)  # Uncomment to see model architecture
 
-    logger.info('Testing forward pass...')
+    if is_rank_zero():
+        print('Testing forward pass...')
+    
     output, _ = net(dummy_input, dummy_lengths)
-    logger.info('Output shape: %s', output.shape)
+    
+    if is_rank_zero():
+        print(f'Output shape: {output.shape}')
 
 
 if __name__ == '__main__':
