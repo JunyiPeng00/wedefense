@@ -23,17 +23,18 @@ from .lsq_quantizer import LSQQuantizer, create_lsq_quantizer
 class QuantizedLinear(nn.Module):
     """Quantized linear layer with LSQ quantization.
     
-    This layer applies LSQ quantization to the weight matrix before
-    performing the linear transformation. The bias (if present) is
-    not quantized as it typically has a smaller impact on model size.
+    This layer applies LSQ quantization to the weight matrix and bias vector
+    before performing the linear transformation.
     
     Args:
         in_features: Number of input features
         out_features: Number of output features
         bias: Whether to include bias term
         weight_quantizer: LSQ quantizer for weights (optional)
+        bias_quantizer: LSQ quantizer for bias (optional)
         activation_quantizer: LSQ quantizer for activations (optional)
         quantize_weights: Whether to quantize weights (default: True)
+        quantize_bias: Whether to quantize bias (default: True)
         quantize_activations: Whether to quantize activations (default: False)
     """
     
@@ -43,12 +44,16 @@ class QuantizedLinear(nn.Module):
         out_features: int,
         bias: bool = True,
         weight_quantizer: Optional[LSQQuantizer] = None,
+        bias_quantizer: Optional[LSQQuantizer] = None,
         activation_quantizer: Optional[LSQQuantizer] = None,
         quantize_weights: bool = True,
+        quantize_bias: bool = True,
         quantize_activations: bool = False,
         weight_bits: int = 8,
+        bias_bits: int = 8,
         activation_bits: int = 8,
         weight_symmetric: bool = True,
+        bias_symmetric: bool = True,
         activation_symmetric: bool = True
     ):
         super().__init__()
@@ -56,12 +61,13 @@ class QuantizedLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.quantize_weights = quantize_weights
+        self.quantize_bias = quantize_bias and bias  # Only quantize bias if it exists
         self.quantize_activations = quantize_activations
         
         # Create linear layer
         self.linear = nn.Linear(in_features, out_features, bias=bias)
         
-        # Initialize quantizers
+        # Initialize weight quantizer
         if quantize_weights:
             if weight_quantizer is not None:
                 self.weight_quantizer = weight_quantizer
@@ -75,6 +81,21 @@ class QuantizedLinear(nn.Module):
         else:
             self.weight_quantizer = None
         
+        # Initialize bias quantizer
+        if self.quantize_bias:
+            if bias_quantizer is not None:
+                self.bias_quantizer = bias_quantizer
+            else:
+                self.bias_quantizer = create_lsq_quantizer(
+                    num_bits=bias_bits,
+                    symmetric=bias_symmetric,
+                    per_channel=False,  # Scalar quantization for bias
+                    channel_axis=0
+                )
+        else:
+            self.bias_quantizer = None
+        
+        # Initialize activation quantizer
         if quantize_activations:
             if activation_quantizer is not None:
                 self.activation_quantizer = activation_quantizer
@@ -102,9 +123,13 @@ class QuantizedLinear(nn.Module):
         else:
             quantized_weight = self.linear.weight
         
-        # Perform linear transformation
+        # Quantize bias if enabled and exists
         if self.linear.bias is not None:
-            output = F.linear(x, quantized_weight, self.linear.bias)
+            if self.quantize_bias and self.bias_quantizer is not None:
+                quantized_bias = self.bias_quantizer(self.linear.bias)
+            else:
+                quantized_bias = self.linear.bias
+            output = F.linear(x, quantized_weight, quantized_bias)
         else:
             output = F.linear(x, quantized_weight)
         
@@ -130,14 +155,22 @@ class QuantizedLinear(nn.Module):
                 self.linear.weight
             )
         
+        if self.quantize_bias and self.bias_quantizer is not None and self.linear.bias is not None:
+            stats['bias_quantization_error'] = self.bias_quantizer.get_quantization_error(
+                self.linear.bias
+            ).item()
+            stats['bias_effective_bits'] = self.bias_quantizer.get_effective_bits(
+                self.linear.bias
+            )
+        
         return stats
 
 
 class QuantizedConv1d(nn.Module):
     """Quantized 1D convolutional layer with LSQ quantization.
     
-    This layer applies LSQ quantization to the weight tensor before
-    performing the convolution operation.
+    This layer applies LSQ quantization to the weight tensor and bias vector
+    before performing the convolution operation.
     
     Args:
         in_channels: Number of input channels
@@ -149,8 +182,10 @@ class QuantizedConv1d(nn.Module):
         groups: Number of blocked connections from input to output channels
         bias: Whether to include bias term
         weight_quantizer: LSQ quantizer for weights (optional)
+        bias_quantizer: LSQ quantizer for bias (optional)
         activation_quantizer: LSQ quantizer for activations (optional)
         quantize_weights: Whether to quantize weights (default: True)
+        quantize_bias: Whether to quantize bias (default: True)
         quantize_activations: Whether to quantize activations (default: False)
     """
     
@@ -165,12 +200,16 @@ class QuantizedConv1d(nn.Module):
         groups: int = 1,
         bias: bool = True,
         weight_quantizer: Optional[LSQQuantizer] = None,
+        bias_quantizer: Optional[LSQQuantizer] = None,
         activation_quantizer: Optional[LSQQuantizer] = None,
         quantize_weights: bool = True,
+        quantize_bias: bool = True,
         quantize_activations: bool = False,
         weight_bits: int = 8,
+        bias_bits: int = 8,
         activation_bits: int = 8,
         weight_symmetric: bool = True,
+        bias_symmetric: bool = True,
         activation_symmetric: bool = True
     ):
         super().__init__()
@@ -183,6 +222,7 @@ class QuantizedConv1d(nn.Module):
         self.dilation = dilation
         self.groups = groups
         self.quantize_weights = quantize_weights
+        self.quantize_bias = quantize_bias and bias  # Only quantize bias if it exists
         self.quantize_activations = quantize_activations
         
         # Create conv1d layer
@@ -190,7 +230,7 @@ class QuantizedConv1d(nn.Module):
             in_channels, out_channels, kernel_size, stride, padding, dilation, groups, bias
         )
         
-        # Initialize quantizers
+        # Initialize weight quantizer
         if quantize_weights:
             if weight_quantizer is not None:
                 self.weight_quantizer = weight_quantizer
@@ -204,6 +244,21 @@ class QuantizedConv1d(nn.Module):
         else:
             self.weight_quantizer = None
         
+        # Initialize bias quantizer
+        if self.quantize_bias:
+            if bias_quantizer is not None:
+                self.bias_quantizer = bias_quantizer
+            else:
+                self.bias_quantizer = create_lsq_quantizer(
+                    num_bits=bias_bits,
+                    symmetric=bias_symmetric,
+                    per_channel=False,  # Scalar quantization for bias
+                    channel_axis=0
+                )
+        else:
+            self.bias_quantizer = None
+        
+        # Initialize activation quantizer
         if quantize_activations:
             if activation_quantizer is not None:
                 self.activation_quantizer = activation_quantizer
@@ -231,10 +286,14 @@ class QuantizedConv1d(nn.Module):
         else:
             quantized_weight = self.conv1d.weight
         
-        # Perform convolution
+        # Quantize bias if enabled and exists
         if self.conv1d.bias is not None:
+            if self.quantize_bias and self.bias_quantizer is not None:
+                quantized_bias = self.bias_quantizer(self.conv1d.bias)
+            else:
+                quantized_bias = self.conv1d.bias
             output = F.conv1d(
-                x, quantized_weight, self.conv1d.bias,
+                x, quantized_weight, quantized_bias,
                 self.stride, self.padding, self.dilation, self.groups
             )
         else:
@@ -263,6 +322,14 @@ class QuantizedConv1d(nn.Module):
             ).item()
             stats['weight_effective_bits'] = self.weight_quantizer.get_effective_bits(
                 self.conv1d.weight
+            )
+        
+        if self.quantize_bias and self.bias_quantizer is not None and self.conv1d.bias is not None:
+            stats['bias_quantization_error'] = self.bias_quantizer.get_quantization_error(
+                self.conv1d.bias
+            ).item()
+            stats['bias_effective_bits'] = self.bias_quantizer.get_effective_bits(
+                self.conv1d.bias
             )
         
         return stats
@@ -404,8 +471,10 @@ class QuantizedGroupNorm(nn.Module):
 def convert_linear_to_quantized(
     linear_layer: nn.Linear,
     weight_bits: int = 8,
+    bias_bits: int = 8,
     activation_bits: int = 8,
     quantize_weights: bool = True,
+    quantize_bias: bool = True,
     quantize_activations: bool = False
 ) -> QuantizedLinear:
     """Convert a standard Linear layer to QuantizedLinear.
@@ -413,8 +482,10 @@ def convert_linear_to_quantized(
     Args:
         linear_layer: Original linear layer
         weight_bits: Number of bits for weight quantization
+        bias_bits: Number of bits for bias quantization
         activation_bits: Number of bits for activation quantization
         quantize_weights: Whether to quantize weights
+        quantize_bias: Whether to quantize bias
         quantize_activations: Whether to quantize activations
         
     Returns:
@@ -425,8 +496,10 @@ def convert_linear_to_quantized(
         out_features=linear_layer.out_features,
         bias=linear_layer.bias is not None,
         quantize_weights=quantize_weights,
+        quantize_bias=quantize_bias,
         quantize_activations=quantize_activations,
         weight_bits=weight_bits,
+        bias_bits=bias_bits,
         activation_bits=activation_bits
     )
     
@@ -442,8 +515,10 @@ def convert_linear_to_quantized(
 def convert_conv1d_to_quantized(
     conv1d_layer: nn.Conv1d,
     weight_bits: int = 8,
+    bias_bits: int = 8,
     activation_bits: int = 8,
     quantize_weights: bool = True,
+    quantize_bias: bool = True,
     quantize_activations: bool = False
 ) -> QuantizedConv1d:
     """Convert a standard Conv1d layer to QuantizedConv1d.
@@ -451,8 +526,10 @@ def convert_conv1d_to_quantized(
     Args:
         conv1d_layer: Original conv1d layer
         weight_bits: Number of bits for weight quantization
+        bias_bits: Number of bits for bias quantization
         activation_bits: Number of bits for activation quantization
         quantize_weights: Whether to quantize weights
+        quantize_bias: Whether to quantize bias
         quantize_activations: Whether to quantize activations
         
     Returns:
@@ -468,8 +545,10 @@ def convert_conv1d_to_quantized(
         groups=conv1d_layer.groups,
         bias=conv1d_layer.bias is not None,
         quantize_weights=quantize_weights,
+        quantize_bias=quantize_bias,
         quantize_activations=quantize_activations,
         weight_bits=weight_bits,
+        bias_bits=bias_bits,
         activation_bits=activation_bits
     )
     

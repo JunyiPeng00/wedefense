@@ -32,10 +32,13 @@ class QuantizationConfig:
     def __init__(
         self,
         weight_bits: int = 8,
+        bias_bits: int = 8,
         activation_bits: int = 8,
         weight_symmetric: bool = True,
+        bias_symmetric: bool = True,
         activation_symmetric: bool = True,
         quantize_weights: bool = True,
+        quantize_bias: bool = True,
         quantize_activations: bool = False,
         per_channel_weights: bool = True,
         per_channel_activations: bool = False,
@@ -46,10 +49,13 @@ class QuantizationConfig:
         
         Args:
             weight_bits: Number of bits for weight quantization
+            bias_bits: Number of bits for bias quantization
             activation_bits: Number of bits for activation quantization
             weight_symmetric: Whether to use symmetric quantization for weights
+            bias_symmetric: Whether to use symmetric quantization for bias
             activation_symmetric: Whether to use symmetric quantization for activations
             quantize_weights: Whether to quantize weights
+            quantize_bias: Whether to quantize bias
             quantize_activations: Whether to quantize activations
             per_channel_weights: Whether to use per-channel quantization for weights
             per_channel_activations: Whether to use per-channel quantization for activations
@@ -57,10 +63,13 @@ class QuantizationConfig:
             include_modules: List of module names to include in quantization (if None, all are included)
         """
         self.weight_bits = weight_bits
+        self.bias_bits = bias_bits
         self.activation_bits = activation_bits
         self.weight_symmetric = weight_symmetric
+        self.bias_symmetric = bias_symmetric
         self.activation_symmetric = activation_symmetric
         self.quantize_weights = quantize_weights
+        self.quantize_bias = quantize_bias
         self.quantize_activations = quantize_activations
         self.per_channel_weights = per_channel_weights
         self.per_channel_activations = per_channel_activations
@@ -105,6 +114,106 @@ def collect_lsq_step_size_params(model: nn.Module) -> List[nn.Parameter]:
             uniq.append(p)
             seen.add(pid)
     return uniq
+
+
+def collect_lsq_step_size_params(model: nn.Module) -> List[nn.Parameter]:
+    """Collect all LSQ step_size parameters from a model.
+
+    This searches submodules for 'weight_quantizer', 'bias_quantizer', or 'activation_quantizer'
+    that expose a learnable 'step_size' parameter. Returns a de-duplicated list
+    of those Parameters that require gradients.
+
+    Args:
+        model: The model potentially containing LSQ quantizers
+
+    Returns:
+        List of Parameter objects corresponding to LSQ step sizes.
+    """
+    step_params: List[nn.Parameter] = []
+    for module in model.modules():
+        # weight quantizer
+        if hasattr(module, 'weight_quantizer') and module.weight_quantizer is not None:
+            q = module.weight_quantizer
+            if hasattr(q, 'step_size') and q.step_size is not None and isinstance(q.step_size, torch.nn.Parameter):
+                if q.step_size.requires_grad:
+                    step_params.append(q.step_size)
+        # bias quantizer
+        if hasattr(module, 'bias_quantizer') and module.bias_quantizer is not None:
+            q = module.bias_quantizer
+            if hasattr(q, 'step_size') and q.step_size is not None and isinstance(q.step_size, torch.nn.Parameter):
+                if q.step_size.requires_grad:
+                    step_params.append(q.step_size)
+        # activation quantizer
+        if hasattr(module, 'activation_quantizer') and module.activation_quantizer is not None:
+            q = module.activation_quantizer
+            if hasattr(q, 'step_size') and q.step_size is not None and isinstance(q.step_size, torch.nn.Parameter):
+                if q.step_size.requires_grad:
+                    step_params.append(q.step_size)
+
+    # de-duplicate
+    seen = set()
+    uniq: List[nn.Parameter] = []
+    for p in step_params:
+        pid = id(p)
+        if pid not in seen:
+            uniq.append(p)
+            seen.add(pid)
+    return uniq
+
+
+class QuantizationConfig:
+    """Configuration class for model quantization.
+    
+    This class manages all quantization-related parameters and provides
+    a convenient interface for configuring quantization settings.
+    """
+    
+    def __init__(
+        self,
+        weight_bits: int = 8,
+        bias_bits: int = 8,
+        activation_bits: int = 8,
+        weight_symmetric: bool = True,
+        bias_symmetric: bool = True,
+        activation_symmetric: bool = True,
+        quantize_weights: bool = True,
+        quantize_bias: bool = True,
+        quantize_activations: bool = False,
+        per_channel_weights: bool = True,
+        per_channel_activations: bool = False,
+        exclude_modules: Optional[List[str]] = None,
+        include_modules: Optional[List[str]] = None
+    ):
+        """Initialize quantization configuration.
+        
+        Args:
+            weight_bits: Number of bits for weight quantization
+            bias_bits: Number of bits for bias quantization
+            activation_bits: Number of bits for activation quantization
+            weight_symmetric: Whether to use symmetric quantization for weights
+            bias_symmetric: Whether to use symmetric quantization for bias
+            activation_symmetric: Whether to use symmetric quantization for activations
+            quantize_weights: Whether to quantize weights
+            quantize_bias: Whether to quantize bias
+            quantize_activations: Whether to quantize activations
+            per_channel_weights: Whether to use per-channel quantization for weights
+            per_channel_activations: Whether to use per-channel quantization for activations
+            exclude_modules: List of module names to exclude from quantization
+            include_modules: List of module names to include in quantization (if None, all are included)
+        """
+        self.weight_bits = weight_bits
+        self.bias_bits = bias_bits
+        self.activation_bits = activation_bits
+        self.weight_symmetric = weight_symmetric
+        self.bias_symmetric = bias_symmetric
+        self.activation_symmetric = activation_symmetric
+        self.quantize_weights = quantize_weights
+        self.quantize_bias = quantize_bias
+        self.quantize_activations = quantize_activations
+        self.per_channel_weights = per_channel_weights
+        self.per_channel_activations = per_channel_activations
+        self.exclude_modules = exclude_modules or []
+        self.include_modules = include_modules
     
     def should_quantize_module(self, module_name: str) -> bool:
         """Check if a module should be quantized based on configuration.
@@ -133,10 +242,13 @@ def collect_lsq_step_size_params(model: nn.Module) -> List[nn.Parameter]:
         """
         return {
             'weight_bits': self.weight_bits,
+            'bias_bits': self.bias_bits,
             'activation_bits': self.activation_bits,
             'weight_symmetric': self.weight_symmetric,
+            'bias_symmetric': self.bias_symmetric,
             'activation_symmetric': self.activation_symmetric,
             'quantize_weights': self.quantize_weights,
+            'quantize_bias': self.quantize_bias,
             'quantize_activations': self.quantize_activations,
             'per_channel_weights': self.per_channel_weights,
             'per_channel_activations': self.per_channel_activations,
@@ -610,42 +722,68 @@ def _setup_quantization_training(model: nn.Module, config: QuantizationConfig) -
 QUANTIZATION_CONFIGS = {
     '8bit_symmetric': QuantizationConfig(
         weight_bits=8,
+        bias_bits=8,
         activation_bits=8,
         weight_symmetric=True,
+        bias_symmetric=True,
         activation_symmetric=True,
         quantize_weights=True,
+        quantize_bias=True,
         quantize_activations=False
     ),
     '8bit_asymmetric': QuantizationConfig(
         weight_bits=8,
+        bias_bits=8,
         activation_bits=8,
         weight_symmetric=False,
+        bias_symmetric=False,
         activation_symmetric=False,
         quantize_weights=True,
+        quantize_bias=True,
         quantize_activations=False
     ),
     '4bit_symmetric': QuantizationConfig(
         weight_bits=4,
+        bias_bits=4,
         activation_bits=4,
         weight_symmetric=True,
+        bias_symmetric=True,
         activation_symmetric=True,
         quantize_weights=True,
+        quantize_bias=True,
         quantize_activations=False
     ),
     'mixed_precision': QuantizationConfig(
         weight_bits=8,
+        bias_bits=8,
         activation_bits=16,
         weight_symmetric=True,
+        bias_symmetric=True,
         activation_symmetric=True,
         quantize_weights=True,
+        quantize_bias=True,
         quantize_activations=True
     ),
     'weights_only': QuantizationConfig(
         weight_bits=8,
+        bias_bits=8,
         activation_bits=8,
         weight_symmetric=True,
+        bias_symmetric=True,
         activation_symmetric=True,
         quantize_weights=True,
+        quantize_bias=False,
+        quantize_activations=False
+    ),
+    'weights_and_bias': QuantizationConfig(
+        weight_bits=8,
+        bias_bits=8,
+        activation_bits=8,
+        weight_symmetric=True,
+        bias_symmetric=True,
+        activation_symmetric=True,
+        quantize_weights=True,
+        quantize_bias=True,
         quantize_activations=False
     )
 }
