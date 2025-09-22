@@ -37,7 +37,7 @@ dataset_args:
     upstream_args:
       name: "wavlm_base"
       path_or_url: "./convert/"
-      pruning_units: ""
+      pruning_units: "conv,head,attlayer,interm,ffnlayer"
     frozen: False
     frame_shift: 20
     frame_length: 20
@@ -73,11 +73,12 @@ sparsity_warmup_epochs: 5
 sparsity_schedule: cosine
 min_sparsity: 0.0
 
-use_quantization: true
-quantization_config: 8bit_symmetric
-quantize_weights: true
-quantize_activations: false
-preserve_hp_gating: true
+use_quantization: True
+quantization_config: '8bit_symmetric'  # 或 '4bit_symmetric', 'weights_only' 等
+quantize_weights: True
+quantize_bias: True
+quantize_activations: False
+preserve_hp_gating: True  #
 
 
 margin_scheduler: MarginScheduler

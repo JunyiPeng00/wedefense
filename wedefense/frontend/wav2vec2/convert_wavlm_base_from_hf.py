@@ -51,16 +51,11 @@ def convert_wavlm(
     # 1) Load (or download) from Hugging Face
     # For private models, authenticate beforehand using the terminal:
     # `huggingface-cli login`
-    
-    # 抑制HuggingFace模型加载时的权重初始化警告
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message=".*Some weights of.*were not initialized.*")
-        warnings.filterwarnings("ignore", message=".*You should probably TRAIN this model.*")
-        original = WavLMModel.from_pretrained(
-            model_id,
-            cache_dir=hf_cache_dir,
-            local_files_only=local_files_only,
-        )
+    original = WavLMModel.from_pretrained(
+        model_id,
+        cache_dir=hf_cache_dir,
+        local_files_only=local_files_only,
+    )
 
     # 2) Convert to WeSpeaker structure
     imported, config = import_huggingface_model(original)

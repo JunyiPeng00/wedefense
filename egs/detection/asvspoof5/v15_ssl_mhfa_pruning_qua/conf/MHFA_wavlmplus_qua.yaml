@@ -72,11 +72,12 @@ target_sparsity: 0.0
 initial_reg_lr: 5.0e-2
 sparsity_warmup_epochs: 5
 
-use_quantization: true
-quantization_config: 8bit_symmetric
-quantize_weights: true
-quantize_activations: false
-preserve_hp_gating: true
+use_quantization: True
+quantization_config: '8bit_symmetric'  # 或 '4bit_symmetric', 'weights_only' 等
+quantize_weights: True
+quantize_bias: True
+quantize_activations: False
+preserve_hp_gating: True  #
 
 
 margin_scheduler: MarginScheduler

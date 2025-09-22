@@ -559,3 +559,74 @@ def convert_conv1d_to_quantized(
             quantized_layer.conv1d.bias.copy_(conv1d_layer.bias)
     
     return quantized_layer
+
+
+def convert_layernorm_to_quantized(
+    layernorm_layer: nn.LayerNorm,
+    activation_bits: int = 8,
+    quantize_activations: bool = False,
+    activation_symmetric: bool = True
+) -> QuantizedLayerNorm:
+    """Convert a standard LayerNorm layer to QuantizedLayerNorm.
+    
+    Args:
+        layernorm_layer: Original LayerNorm layer
+        activation_bits: Number of bits for activation quantization
+        quantize_activations: Whether to quantize activations
+        activation_symmetric: Whether to use symmetric quantization for activations
+        
+    Returns:
+        QuantizedLayerNorm layer with copied parameters
+    """
+    quantized_layer = QuantizedLayerNorm(
+        normalized_shape=layernorm_layer.normalized_shape,
+        eps=layernorm_layer.eps,
+        elementwise_affine=layernorm_layer.elementwise_affine,
+        quantize_activations=quantize_activations,
+        activation_bits=activation_bits,
+        activation_symmetric=activation_symmetric
+    )
+    
+    # Copy parameters
+    with torch.no_grad():
+        if layernorm_layer.elementwise_affine:
+            quantized_layer.layer_norm.weight.copy_(layernorm_layer.weight)
+            quantized_layer.layer_norm.bias.copy_(layernorm_layer.bias)
+    
+    return quantized_layer
+
+
+def convert_groupnorm_to_quantized(
+    groupnorm_layer: nn.GroupNorm,
+    activation_bits: int = 8,
+    quantize_activations: bool = False,
+    activation_symmetric: bool = True
+) -> QuantizedGroupNorm:
+    """Convert a standard GroupNorm layer to QuantizedGroupNorm.
+    
+    Args:
+        groupnorm_layer: Original GroupNorm layer
+        activation_bits: Number of bits for activation quantization
+        quantize_activations: Whether to quantize activations
+        activation_symmetric: Whether to use symmetric quantization for activations
+        
+    Returns:
+        QuantizedGroupNorm layer with copied parameters
+    """
+    quantized_layer = QuantizedGroupNorm(
+        num_groups=groupnorm_layer.num_groups,
+        num_channels=groupnorm_layer.num_channels,
+        eps=groupnorm_layer.eps,
+        affine=groupnorm_layer.affine,
+        quantize_activations=quantize_activations,
+        activation_bits=activation_bits,
+        activation_symmetric=activation_symmetric
+    )
+    
+    # Copy parameters
+    with torch.no_grad():
+        if groupnorm_layer.affine:
+            quantized_layer.group_norm.weight.copy_(groupnorm_layer.weight)
+            quantized_layer.group_norm.bias.copy_(groupnorm_layer.bias)
+    
+    return quantized_layer

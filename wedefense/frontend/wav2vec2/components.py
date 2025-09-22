@@ -126,8 +126,17 @@ class ConvLayerBlock(Module):
             out_channels = self.conv.out_channels
         
         num_params = in_channels * out_channels * self.kernel_size
-        if self.conv.bias is not None:
-            num_params += out_channels
+        
+        # Handle both regular Conv1d and QuantizedConv1d
+        if hasattr(self.conv, 'conv1d'):
+            # QuantizedConv1d
+            if self.conv.conv1d.bias is not None:
+                num_params += out_channels
+        else:
+            # Regular Conv1d
+            if self.conv.bias is not None:
+                num_params += out_channels
+                
         if self.layer_norm is not None:
             num_params += out_channels * 2
         
@@ -457,8 +466,19 @@ class SelfAttention(Module):
         if self.hard_concrete_for_layer is not None:
             assert not self.hard_concrete_for_layer.training
             layer_mask = self.hard_concrete_for_layer() # (1,)
-            self.out_proj.weight.data *= layer_mask
-            self.out_proj.bias.data *= layer_mask
+            
+            # Handle both regular Linear and QuantizedLinear
+            if hasattr(self.out_proj, 'linear'):
+                # QuantizedLinear
+                self.out_proj.linear.weight.data *= layer_mask
+                if self.out_proj.linear.bias is not None:
+                    self.out_proj.linear.bias.data *= layer_mask
+            else:
+                # Regular Linear
+                self.out_proj.weight.data *= layer_mask
+                if self.out_proj.bias is not None:
+                    self.out_proj.bias.data *= layer_mask
+            
             if layer_mask == 0:
                 new_config["use_attention"] = False
             self.hard_concrete_for_layer = None
@@ -667,8 +687,19 @@ class WavLMSelfAttention(SelfAttention):
         if self.hard_concrete_for_layer is not None:
             assert not self.hard_concrete_for_layer.training
             layer_mask = self.hard_concrete_for_layer() # (1,)
-            self.out_proj.weight.data *= layer_mask
-            self.out_proj.bias.data *= layer_mask
+            
+            # Handle both regular Linear and QuantizedLinear
+            if hasattr(self.out_proj, 'linear'):
+                # QuantizedLinear
+                self.out_proj.linear.weight.data *= layer_mask
+                if self.out_proj.linear.bias is not None:
+                    self.out_proj.linear.bias.data *= layer_mask
+            else:
+                # Regular Linear
+                self.out_proj.weight.data *= layer_mask
+                if self.out_proj.bias is not None:
+                    self.out_proj.bias.data *= layer_mask
+            
             if layer_mask == 0:
                 new_config["use_attention"] = False
             self.hard_concrete_for_layer = None
@@ -761,6 +792,28 @@ class FeedForward(Module):
         
         return num_params
     
+    def _get_layer_weight_bias(self, layer):
+        """Get weight and bias from a layer (handles both Linear and QuantizedLinear)."""
+        if hasattr(layer, 'linear'):
+            # QuantizedLinear layer
+            return layer.linear.weight, layer.linear.bias
+        else:
+            # Regular Linear layer
+            return layer.weight, layer.bias
+    
+    def _set_layer_weight_bias(self, layer, weight, bias):
+        """Set weight and bias for a layer (handles both Linear and QuantizedLinear)."""
+        if hasattr(layer, 'linear'):
+            # QuantizedLinear layer
+            layer.linear.weight = weight
+            if bias is not None:
+                layer.linear.bias = bias
+        else:
+            # Regular Linear layer
+            layer.weight = weight
+            if bias is not None:
+                layer.bias = bias
+
     def prune(self):
         new_config = {
             "use_feed_forward": True,
@@ -769,8 +822,18 @@ class FeedForward(Module):
         if self.hard_concrete_for_layer is not None:
             assert not self.hard_concrete_for_layer.training
             layer_mask = self.hard_concrete_for_layer()
-            self.output_dense.weight.data *= layer_mask
-            self.output_dense.bias.data *= layer_mask
+            
+            # Get current weight and bias
+            weight, bias = self._get_layer_weight_bias(self.output_dense)
+            
+            # Apply mask
+            weight.data *= layer_mask
+            if bias is not None:
+                bias.data *= layer_mask
+            
+            # Set back the modified weight and bias
+            self._set_layer_weight_bias(self.output_dense, weight, bias)
+            
             if layer_mask == 0:
                 new_config["use_feed_forward"] = False
             self.hard_concrete_for_layer = None
@@ -785,7 +848,14 @@ class FeedForward(Module):
             else:
                 prune_linear_layer(self.intermediate_dense, interm_index, "output")
 
-                self.output_dense.weight.data *= interm_mask
+                # Apply mask to output dense layer (only to input dimension)
+                weight, bias = self._get_layer_weight_bias(self.output_dense)
+                # For output_dense, we need to apply the mask to the input dimension (dim=1)
+                # weight shape is (out_features, in_features) = (768, 3072)
+                weight.data *= interm_mask.unsqueeze(0)  # Broadcast to (1, 3072)
+                # Bias doesn't need intermediate mask as it's only (768,)
+                self._set_layer_weight_bias(self.output_dense, weight, bias)
+                
                 prune_linear_layer(self.output_dense, interm_index, "input")
             self.hard_concrete_for_intermediate = None
 

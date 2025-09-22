@@ -17,8 +17,12 @@ from .lsq_quantizer import LSQQuantizer, create_lsq_quantizer
 from .quantized_layers import (
     QuantizedConv1d,
     QuantizedLinear,
+    QuantizedLayerNorm,
+    QuantizedGroupNorm,
     convert_conv1d_to_quantized,
-    convert_linear_to_quantized
+    convert_linear_to_quantized,
+    convert_layernorm_to_quantized,
+    convert_groupnorm_to_quantized
 )
 
 
@@ -312,9 +316,24 @@ def quantize_model(
             
             setattr(parent_module, attr_name, quantized_layer)
     
-    # Convert conv1d layers
+    # Convert conv1d layers (including weight_norm wrapped ones)
     for name, module in model.named_modules():
-        if isinstance(module, nn.Conv1d) and config.should_quantize_module(name):
+        # Check for both regular Conv1d and weight_norm wrapped Conv1d
+        is_conv1d = isinstance(module, nn.Conv1d) or (
+            hasattr(module, 'weight') and 
+            hasattr(module, 'bias') and 
+            hasattr(module, 'in_channels') and 
+            hasattr(module, 'out_channels') and
+            hasattr(module, 'kernel_size') and
+            hasattr(module, 'stride') and
+            hasattr(module, 'padding') and
+            hasattr(module, 'dilation') and
+            hasattr(module, 'groups') and
+            hasattr(module, 'forward') and
+            callable(getattr(module, 'forward'))
+        )
+        
+        if is_conv1d and config.should_quantize_module(name):
             # Find the parent module and attribute name
             parent_name = '.'.join(name.split('.')[:-1])
             attr_name = name.split('.')[-1]
@@ -327,12 +346,93 @@ def quantize_model(
                 parent_module = model
             
             # Convert to quantized layer
-            quantized_layer = convert_conv1d_to_quantized(
+            # Handle weight_norm wrapped conv1d by extracting the underlying conv layer
+            if hasattr(module, 'parametrizations') and 'weight' in module.parametrizations:
+                # This is a weight_norm wrapped conv1d, we need to handle it specially
+                # For now, we'll create a regular conv1d with the same parameters
+                underlying_conv = nn.Conv1d(
+                    in_channels=module.in_channels,
+                    out_channels=module.out_channels,
+                    kernel_size=module.kernel_size,
+                    stride=module.stride,
+                    padding=module.padding,
+                    dilation=module.dilation,
+                    groups=module.groups,
+                    bias=module.bias is not None
+                )
+                # Copy the actual weight (after weight_norm transformation)
+                with torch.no_grad():
+                    underlying_conv.weight.copy_(module.weight)
+                    if module.bias is not None:
+                        underlying_conv.bias.copy_(module.bias)
+                
+                quantized_layer = convert_conv1d_to_quantized(
+                    underlying_conv,
+                    weight_bits=config.weight_bits,
+                    bias_bits=config.bias_bits,
+                    activation_bits=config.activation_bits,
+                    quantize_weights=config.quantize_weights,
+                    quantize_bias=config.quantize_bias,
+                    quantize_activations=config.quantize_activations
+                )
+            else:
+                # Regular conv1d
+                quantized_layer = convert_conv1d_to_quantized(
+                    module,
+                    weight_bits=config.weight_bits,
+                    bias_bits=config.bias_bits,
+                    activation_bits=config.activation_bits,
+                    quantize_weights=config.quantize_weights,
+                    quantize_bias=config.quantize_bias,
+                    quantize_activations=config.quantize_activations
+                )
+            
+            setattr(parent_module, attr_name, quantized_layer)
+    
+    # Convert LayerNorm layers
+    for name, module in model.named_modules():
+        if isinstance(module, nn.LayerNorm) and config.should_quantize_module(name):
+            # Find the parent module and attribute name
+            parent_name = '.'.join(name.split('.')[:-1])
+            attr_name = name.split('.')[-1]
+            
+            if parent_name:
+                parent_module = model
+                for part in parent_name.split('.'):
+                    parent_module = getattr(parent_module, part)
+            else:
+                parent_module = model
+            
+            # Convert to quantized layer
+            quantized_layer = convert_layernorm_to_quantized(
                 module,
-                weight_bits=config.weight_bits,
                 activation_bits=config.activation_bits,
-                quantize_weights=config.quantize_weights,
-                quantize_activations=config.quantize_activations
+                quantize_activations=config.quantize_activations,
+                activation_symmetric=config.activation_symmetric
+            )
+            
+            setattr(parent_module, attr_name, quantized_layer)
+    
+    # Convert GroupNorm layers
+    for name, module in model.named_modules():
+        if isinstance(module, nn.GroupNorm) and config.should_quantize_module(name):
+            # Find the parent module and attribute name
+            parent_name = '.'.join(name.split('.')[:-1])
+            attr_name = name.split('.')[-1]
+            
+            if parent_name:
+                parent_module = model
+                for part in parent_name.split('.'):
+                    parent_module = getattr(parent_module, part)
+            else:
+                parent_module = model
+            
+            # Convert to quantized layer
+            quantized_layer = convert_groupnorm_to_quantized(
+                module,
+                activation_bits=config.activation_bits,
+                quantize_activations=config.quantize_activations,
+                activation_symmetric=config.activation_symmetric
             )
             
             setattr(parent_module, attr_name, quantized_layer)
@@ -586,13 +686,28 @@ def apply_quantization(
                         quantized_child = convert_conv1d_to_quantized(
                             child_module,
                             weight_bits=config.weight_bits,
+                            bias_bits=config.bias_bits,
                             activation_bits=config.activation_bits,
                             quantize_weights=config.quantize_weights,
+                            quantize_bias=config.quantize_bias,
                             quantize_activations=config.quantize_activations
                         )
+                    elif isinstance(child_module, nn.LayerNorm):
+                        quantized_child = convert_layernorm_to_quantized(
+                            child_module,
+                            activation_bits=config.activation_bits,
+                            quantize_activations=config.quantize_activations,
+                            activation_symmetric=config.activation_symmetric
+                        )
+                    elif isinstance(child_module, nn.GroupNorm):
+                        quantized_child = convert_groupnorm_to_quantized(
+                            child_module,
+                            activation_bits=config.activation_bits,
+                            quantize_activations=config.quantize_activations,
+                            activation_symmetric=config.activation_symmetric
+                        )
                     else:
-                        # For LayerNorm/GroupNorm, we don't quantize by default
-                        # as they typically don't benefit from quantization
+                        # Skip other module types
                         conversion_stats['skipped_modules'] += 1
                         convert_module(child_module, full_name)
                         continue
@@ -677,10 +792,12 @@ def apply_quantization_with_hp_integration(
 def _enable_hp_gating(model: nn.Module, pruning_config: Dict) -> None:
     """Enable Hard Concrete gating for structured pruning."""
     from .hardconcrete import HardConcrete
+    from .components import ConvolutionalPositionalEmbedding
     
     for name, module in model.named_modules():
         # Enable gating for convolutional layers
-        if hasattr(module, 'conv') and isinstance(module.conv, nn.Conv1d):
+        if (hasattr(module, 'conv') and isinstance(module.conv, nn.Conv1d) and 
+            not isinstance(module, ConvolutionalPositionalEmbedding)):
             if not hasattr(module, 'hard_concrete') or module.hard_concrete is None:
                 out_channels = module.conv.out_channels
                 module.hard_concrete = HardConcrete(n_in=out_channels, init_mean=0.01)
