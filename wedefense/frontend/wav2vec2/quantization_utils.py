@@ -309,8 +309,10 @@ def quantize_model(
             quantized_layer = convert_linear_to_quantized(
                 module,
                 weight_bits=config.weight_bits,
+                bias_bits=config.bias_bits,
                 activation_bits=config.activation_bits,
                 quantize_weights=config.quantize_weights,
+                quantize_bias=config.quantize_bias,
                 quantize_activations=config.quantize_activations
             )
             
@@ -678,8 +680,10 @@ def apply_quantization(
                         quantized_child = convert_linear_to_quantized(
                             child_module, 
                             weight_bits=config.weight_bits,
+                            bias_bits=config.bias_bits,
                             activation_bits=config.activation_bits,
                             quantize_weights=config.quantize_weights,
+                            quantize_bias=config.quantize_bias,
                             quantize_activations=config.quantize_activations
                         )
                     elif isinstance(child_module, nn.Conv1d):
@@ -863,6 +867,28 @@ QUANTIZATION_CONFIGS = {
         weight_bits=4,
         bias_bits=4,
         activation_bits=4,
+        weight_symmetric=True,
+        bias_symmetric=True,
+        activation_symmetric=True,
+        quantize_weights=True,
+        quantize_bias=True,
+        quantize_activations=False
+    ),
+    '2bit_symmetric': QuantizationConfig(
+        weight_bits=2,
+        bias_bits=2,
+        activation_bits=2,
+        weight_symmetric=True,
+        bias_symmetric=True,
+        activation_symmetric=True,
+        quantize_weights=True,
+        quantize_bias=True,
+        quantize_activations=False
+    ),
+    '1bit_symmetric': QuantizationConfig(
+        weight_bits=1,
+        bias_bits=1,
+        activation_bits=1,
         weight_symmetric=True,
         bias_symmetric=True,
         activation_symmetric=True,

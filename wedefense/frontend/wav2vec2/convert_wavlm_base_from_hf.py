@@ -99,9 +99,9 @@ if __name__ == "__main__":
     )
 
     # Convert wavlm_large
-    convert_wavlm(
-        model_size="wavlm_large",
-        exp_dir=EXP_DIR,
-        hf_cache_dir=HF_CACHE,
-        local_files_only=False,
-    )
+    # convert_wavlm(
+    #     model_size="wavlm_large",
+    #     exp_dir=EXP_DIR,
+    #     hf_cache_dir=HF_CACHE,
+    #     local_files_only=False,
+    # )

@@ -7,18 +7,19 @@
 
 # set -x
 . ./path.sh || exit 1
-. ./lumi.sh || exit 1
+# . ./lumi.sh || exit 1
+export WANDB_MODE=offline
 
 stage=3
 stop_stage=3
 
 ASVspoof5_dir=/gs/bs/tgh-25IAC/ud03523/DATA/ASVspoof5
-data=data/asvspoof5 # data folder
+data=data/asv5 # data folder
 data_type="raw"  # shard/raw
 
 config=conf/MHFA_wav2vec2.yaml #wespeaker version
 exp_dir=exp/W2V2baseFrozen-MHFA-TSTP-emb256-num_frms150-aug0-spFalse-saFalse-Softmax-SGD-epoch20
-gpus="[0,1,2,3,4,5,6,7]"
+gpus="[0]"
 num_avg=2 # how many models you want to average
 checkpoint=
 score_norm_method="asnorm"  # asnorm/snorm
@@ -95,8 +96,7 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
       break
     fi
   done
-    # torchrun --rdzv_backend=c10d --rdzv_endpoint=$(hostname):$((port)) --nnodes=1 --nproc_per_node=$num_gpus \
-    python -m torch.distributed.launch --standalone --nnodes=1 --nproc_per_node=$num_gpus \
+    torchrun --rdzv_backend=c10d --rdzv_endpoint=$(hostname):$((port)) --nnodes=1 --nproc_per_node=$num_gpus \
       wedefense/bin/train.py --config $config \
         --exp_dir ${exp_dir} \
         --gpus $gpus \
@@ -104,9 +104,8 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
         --data_type "${data_type}" \
         --train_data ${data}/train/${data_type}.list \
         --train_label ${data}/train/utt2lab \
-        --train_lmdb ${data}/train/lmdb \
-        --reverb_data data/rirs/lmdb \
-        --noise_data data/musan/lmdb \
+        --reverb_data ${data}/rirs/lmdb/lmdb \
+        --noise_data ${data}/musan/lmdb \
         ${checkpoint:+--checkpoint $checkpoint} 
 	#TODO, currently also moved from local/extract_emb.sh, flexible to control musan/rirs.
 fi
