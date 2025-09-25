@@ -80,6 +80,9 @@ def train_epoch(dataloader,
 
 
     frontend_type = configs['dataset_args'].get('frontend', 'fbank')
+    # Optional two-phase LSQ controller from configs
+    lsq_controller = configs.get('lsq_controller', None)
+
     for i, batch in enumerate(dataloader):
         cur_iter = (epoch - 1) * epoch_iter + i
         scheduler.step(cur_iter)
@@ -158,8 +161,22 @@ def train_epoch(dataloader,
             optimizer_reg.zero_grad()
         
         # Backward pass with gradient scaling
+        # Two-phase LSQ: unfreeze when reaching freeze boundary
+        if lsq_controller is not None:
+            try:
+                lsq_controller.maybe_unfreeze(cur_iter)
+            except Exception:
+                pass
+
         scaler.scale(total_loss).backward()
         
+        # Gradient clipping when enabled via controller
+        if lsq_controller is not None:
+            try:
+                lsq_controller.clip_gradients()
+            except Exception:
+                pass
+
         # Update optimizers
         if use_pruning:
             scaler.step(optimizer_reg)

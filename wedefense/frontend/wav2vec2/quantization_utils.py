@@ -8,10 +8,11 @@ This module provides utility functions for model quantization, including:
 """
 
 import copy
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, Iterable, Type
 
 import torch
 import torch.nn as nn
+from torch.nn.utils import clip_grad_norm_
 
 from .lsq_quantizer import LSQQuantizer, create_lsq_quantizer
 from .quantized_layers import (
@@ -163,6 +164,96 @@ def collect_lsq_step_size_params(model: nn.Module) -> List[nn.Parameter]:
             uniq.append(p)
             seen.add(pid)
     return uniq
+
+
+def build_two_phase_lsq_optimizer(
+    model: nn.Module,
+    base_optimizer_cls: Type[torch.optim.Optimizer],
+    main_lr: float,
+    step_lr: float,
+    weight_decay: float = 1e-7,
+    **optimizer_kwargs: Any,
+) -> torch.optim.Optimizer:
+    """Create optimizer with two parameter groups: main params vs. LSQ step_size params.
+
+    This utility separates LSQ ``step_size`` parameters into a dedicated parameter group
+    with a typically smaller learning rate to stabilize training under low-bit QAT.
+
+    Args:
+        model: Model containing quantized layers.
+        base_optimizer_cls: Optimizer class, e.g., ``torch.optim.AdamW``.
+        main_lr: Learning rate for regular parameters.
+        step_lr: Learning rate for LSQ ``step_size`` parameters.
+        weight_decay: Weight decay applied to both groups (if desired).
+        optimizer_kwargs: Extra kwargs forwarded to the optimizer.
+
+    Returns:
+        Configured optimizer instance with two parameter groups.
+    """
+    step_params = set(collect_lsq_step_size_params(model))
+    main_params: List[nn.Parameter] = []
+    lsq_params: List[nn.Parameter] = []
+
+    for param in model.parameters():
+        if param in step_params:
+            lsq_params.append(param)
+        else:
+            main_params.append(param)
+
+    param_groups = [
+        {"params": main_params, "lr": main_lr, "weight_decay": weight_decay},
+        {"params": lsq_params, "lr": step_lr, "weight_decay": weight_decay},
+    ]
+    optimizer = base_optimizer_cls(param_groups, **optimizer_kwargs)
+    return optimizer
+
+
+class TwoPhaseLSQController:
+    """Two-phase LSQ training controller.
+
+    Phase 1 (warmup): Freeze LSQ step sizes and only train regular parameters for ``freeze_steps``.
+    Phase 2: Unfreeze LSQ step sizes and continue training with a smaller step-size LR.
+
+    Additionally provides gradient clipping per iteration to stabilize updates.
+
+    Usage pattern per iteration:
+        controller.maybe_unfreeze(global_step)
+        loss.backward()
+        controller.clip_gradients()
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        freeze_steps: int = 2000,
+        clip_norm: float = 1.0,
+    ) -> None:
+        self.model = model
+        self.optimizer = optimizer
+        self.freeze_steps = int(max(0, freeze_steps))
+        self.clip_norm = float(max(0.0, clip_norm))
+        self._unfrozen: bool = self.freeze_steps == 0
+
+        if not self._unfrozen:
+            freeze_quantization_parameters(self.model)
+
+    def maybe_unfreeze(self, global_step: int) -> None:
+        """Unfreeze LSQ step sizes when reaching the boundary ``freeze_steps``.
+
+        Args:
+            global_step: Current global optimization step (starting from 0 or 1, both ok).
+        """
+        if not self._unfrozen and global_step >= self.freeze_steps:
+            unfreeze_quantization_parameters(self.model)
+            self._unfrozen = True
+
+    def clip_gradients(self) -> None:
+        """Apply global norm gradient clipping if ``clip_norm > 0``."""
+        if self.clip_norm > 0.0:
+            clip_grad_norm_(self.model.parameters(), max_norm=self.clip_norm)
 
 
 class QuantizationConfig:
@@ -467,10 +558,15 @@ def get_quantization_stats(model: nn.Module) -> Dict[str, Any]:
             stats['quantized_modules'].append(name)
         
         # Count parameters
-        for param in module.parameters():
+        for name, param in module.named_parameters(recurse=False):
             stats['total_parameters'] += param.numel()
-            if hasattr(module, 'weight_quantizer') and module.weight_quantizer is not None:
-                stats['quantized_parameters'] += param.numel()
+            # Count only the tensors actually quantized: weights and optionally bias
+            if name == 'linear.weight' or name == 'conv1d.weight' or name == 'weight':
+                if hasattr(module, 'weight_quantizer') and module.weight_quantizer is not None:
+                    stats['quantized_parameters'] += param.numel()
+            if name == 'linear.bias' or name == 'conv1d.bias' or name == 'bias':
+                if hasattr(module, 'bias_quantizer') and module.bias_quantizer is not None:
+                    stats['quantized_parameters'] += param.numel()
     
     return stats
 
@@ -845,6 +941,17 @@ QUANTIZATION_CONFIGS = {
         weight_bits=8,
         bias_bits=8,
         activation_bits=8,
+        weight_symmetric=True,
+        bias_symmetric=True,
+        activation_symmetric=True,
+        quantize_weights=True,
+        quantize_bias=True,
+        quantize_activations=False
+    ),
+    '6bit_symmetric': QuantizationConfig(
+        weight_bits=6,
+        bias_bits=6,
+        activation_bits=6,
         weight_symmetric=True,
         bias_symmetric=True,
         activation_symmetric=True,

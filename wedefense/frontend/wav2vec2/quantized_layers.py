@@ -72,12 +72,18 @@ class QuantizedLinear(nn.Module):
             if weight_quantizer is not None:
                 self.weight_quantizer = weight_quantizer
             else:
+                # Prefer per-channel quantization for weights (better accuracy)
                 self.weight_quantizer = create_lsq_quantizer(
                     num_bits=weight_bits,
                     symmetric=weight_symmetric,
-                    per_channel=False,  # Scalar quantization for weights (simpler for optimizer)
-                    channel_axis=0
+                    per_channel=True,
+                    channel_axis=0  # output features axis for Linear
                 )
+            # Data-driven initialization from existing weights
+            try:
+                self.weight_quantizer.initialize_from_tensor(self.linear.weight)
+            except Exception:
+                pass
         else:
             self.weight_quantizer = None
         
@@ -92,6 +98,10 @@ class QuantizedLinear(nn.Module):
                     per_channel=False,  # Scalar quantization for bias
                     channel_axis=0
                 )
+            try:
+                self.bias_quantizer.initialize_from_tensor(self.linear.bias)
+            except Exception:
+                pass
         else:
             self.bias_quantizer = None
         
@@ -235,12 +245,17 @@ class QuantizedConv1d(nn.Module):
             if weight_quantizer is not None:
                 self.weight_quantizer = weight_quantizer
             else:
+                # Prefer per-channel quantization for weights (better accuracy)
                 self.weight_quantizer = create_lsq_quantizer(
                     num_bits=weight_bits,
                     symmetric=weight_symmetric,
-                    per_channel=False,  # Scalar quantization for weights (simpler for optimizer)
-                    channel_axis=0
+                    per_channel=True,
+                    channel_axis=0  # output channels axis for Conv1d
                 )
+            try:
+                self.weight_quantizer.initialize_from_tensor(self.conv1d.weight)
+            except Exception:
+                pass
         else:
             self.weight_quantizer = None
         
@@ -255,6 +270,10 @@ class QuantizedConv1d(nn.Module):
                     per_channel=False,  # Scalar quantization for bias
                     channel_axis=0
                 )
+            try:
+                self.bias_quantizer.initialize_from_tensor(self.conv1d.bias)
+            except Exception:
+                pass
         else:
             self.bias_quantizer = None
         

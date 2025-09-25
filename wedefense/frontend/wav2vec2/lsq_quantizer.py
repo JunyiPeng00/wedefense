@@ -57,26 +57,47 @@ class LSQQuantizerFunction(torch.autograd.Function):
         
         # Calculate quantization parameters
         if symmetric:
-            # Symmetric quantization: [-2^(b-1), 2^(b-1)-1]
-            q_min = -(2 ** (num_bits - 1))
-            q_max = 2 ** (num_bits - 1) - 1
+            # Symmetric quantization.
+            # Special-case 1-bit to be true binary levels {-1, +1}.
+            if num_bits == 1:
+                q_min = -1
+                q_max = 1
+            else:
+                # General symmetric range: [-2^(b-1), 2^(b-1)-1]
+                q_min = -(2 ** (num_bits - 1))
+                q_max = 2 ** (num_bits - 1) - 1
+            zero_point = 0.0
         else:
             # Asymmetric quantization: [0, 2^b-1]
             q_min = 0
             q_max = 2 ** num_bits - 1
-        
-        # Quantization process
-        # 1. Scale by step size
-        x_scaled = x / step_size
-        
+            # Derive a per-tensor zero_point from current tensor range and step_size.
+            # Standard affine relation: r ≈ s(q - z) ⇒ z ≈ q_min - rmin/s
+            rmin = torch.min(x.detach())
+            zp = torch.round(q_min - rmin / step_size)
+            zero_point = torch.clamp(zp, q_min, q_max)
+            # Ensure tensor type for broadcasting
+            if not torch.is_tensor(zero_point):
+                zero_point = torch.tensor(zero_point, device=x.device, dtype=x.dtype)
+
+        # Quantization process (with zero_point for asymmetric)
+        # 1. Scale-and-shift to integer domain
+        if symmetric:
+            x_scaled = x / step_size
+        else:
+            x_scaled = x / step_size + zero_point
+
         # 2. Clamp to quantization range
         x_clamped = torch.clamp(x_scaled, q_min, q_max)
-        
+
         # 3. Round to nearest integer
         x_rounded = torch.round(x_clamped)
-        
-        # 4. Scale back by step size
-        x_quantized = x_rounded * step_size
+
+        # 4. Dequantize back to float domain
+        if symmetric:
+            x_quantized = x_rounded * step_size
+        else:
+            x_quantized = (x_rounded - zero_point) * step_size
         
         return x_quantized
     
@@ -101,23 +122,36 @@ class LSQQuantizerFunction(torch.autograd.Function):
         
         # Calculate quantization parameters
         if symmetric:
-            q_min = -(2 ** (num_bits - 1))
-            q_max = 2 ** (num_bits - 1) - 1
+            if num_bits == 1:
+                q_min = -1
+                q_max = 1
+            else:
+                q_min = -(2 ** (num_bits - 1))
+                q_max = 2 ** (num_bits - 1) - 1
+            zero_point = 0.0
         else:
             q_min = 0
             q_max = 2 ** num_bits - 1
-        
-        # Gradient for input x: Straight-Through Estimator (STE)
-        # The gradient is 1 where x is in the valid range, 0 otherwise
-        x_scaled = x / step_size
-        grad_x = grad_output.clone()
-        
-        # Gradient for step size: LSQ specific formula
-        # grad_s = grad_output * (x_rounded - x_scaled)
+            rmin = torch.min(x.detach())
+            zp = torch.round(q_min - rmin / step_size)
+            zero_point = torch.clamp(zp, q_min, q_max)
+            if not torch.is_tensor(zero_point):
+                zero_point = torch.tensor(zero_point, device=x.device, dtype=x.dtype)
+
+        # Gradient for input x: STE with clamping mask
+        if symmetric:
+            x_scaled = x / step_size
+        else:
+            x_scaled = x / step_size + zero_point
+
         x_scaled_clamped = torch.clamp(x_scaled, q_min, q_max)
         x_rounded = torch.round(x_scaled_clamped)
-        
-        # LSQ gradient formula
+
+        # Mask: gradient only passes where values are within quant range
+        mask = (x_scaled >= q_min) & (x_scaled <= q_max)
+        grad_x = grad_output * mask.to(grad_output.dtype)
+
+        # LSQ gradient for step_size with gradient scaling
         grad_step_size = grad_output * (x_rounded - x_scaled)
         
         # Sum over all dimensions except the step size dimension
@@ -139,6 +173,14 @@ class LSQQuantizerFunction(torch.autograd.Function):
             # Ensure the shape matches step_size
             if grad_step_size.shape != step_size.shape:
                 grad_step_size = grad_step_size.view(step_size.shape)
+
+        # Gradient scaling per LSQ to stabilize step_size learning
+        # g ≈ 1 / sqrt(N * q_max) for a general case (heuristic)
+        N = x.numel()
+        denom = max(float(q_max), 1.0)
+        grad_scale = 1.0 / math.sqrt(N * denom)
+        if isinstance(grad_step_size, torch.Tensor):
+            grad_step_size = grad_step_size * grad_scale
         
         return grad_x, grad_step_size, None, None
 
@@ -172,7 +214,7 @@ class LSQQuantizer(nn.Module):
         self.per_channel = per_channel
         self.channel_axis = channel_axis
         
-        # Initialize step size
+        # Initialize step size (default constant; can be overridden via initialize_from_tensor)
         if init_step_size is None:
             # Default initialization: 2 * mean(|x|) / sqrt(2^b)
             # This is a common heuristic for LSQ initialization
@@ -217,6 +259,43 @@ class LSQQuantizer(nn.Module):
         return LSQQuantizerFunction.apply(
             x, self.step_size, self.num_bits, self.symmetric
         )
+
+    @torch.no_grad()
+    def initialize_from_tensor(self, tensor: torch.Tensor) -> None:
+        """Initialize step size using data-driven LSQ heuristic.
+
+        Uses 2 * mean(|x|) / sqrt(q_max) as in LSQ, with per-channel supported
+        when this quantizer is configured as per_channel.
+
+        Args:
+            tensor: Reference tensor (e.g., weights) to estimate scale from.
+        """
+        if self.symmetric:
+            if self.num_bits == 1:
+                q_max = 1.0
+            else:
+                q_max = float(2 ** (self.num_bits - 1) - 1)
+        else:
+            q_max = float(2 ** self.num_bits - 1)
+
+        eps = torch.finfo(tensor.dtype).eps if tensor.is_floating_point() else 1e-8
+
+        if self.per_channel:
+            # Ensure step_size parameter exists with correct shape
+            if self.step_size is None:
+                self._initialize_per_channel_step_size(tensor)
+            # Reduce mean abs along all dims except channel_axis
+            reduce_dims = [d for d in range(tensor.ndim) if d != self.channel_axis]
+            mean_abs = tensor.abs().mean(dim=reduce_dims, keepdim=True)
+            scale = 2.0 * mean_abs / math.sqrt(max(q_max, 1.0))
+            # Clamp to avoid zeros/NaNs
+            scale = torch.clamp(scale, min=eps)
+            self.step_size.copy_(scale)
+        else:
+            mean_abs = tensor.abs().mean()
+            scale = 2.0 * mean_abs / math.sqrt(max(q_max, 1.0))
+            scale = float(max(scale.item(), eps))
+            self.step_size.copy_(torch.tensor(scale, device=self.step_size.device, dtype=self.step_size.dtype))
     
     def get_quantization_error(self, x: torch.Tensor) -> torch.Tensor:
         """Calculate the quantization error (MSE between original and quantized).

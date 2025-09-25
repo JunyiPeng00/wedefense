@@ -84,21 +84,10 @@ fi
 if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
   echo "Start training ..."
   num_gpus=1
-  # 在集群环境中使用环境变量获取GPU，避免safe_gpu权限问题
   if [[ $(hostname -f) == *fit.vutbr.cz   ]]; then
-    # 尝试使用safe_gpu，如果失败则使用环境变量
-    if ! gpus=$(python -c "from sys import argv; from safe_gpu import safe_gpu; safe_gpu.claim_gpus(int(argv[1])); print( safe_gpu.gpu_owner.devices_taken )" $num_gpus 2>/dev/null | sed "s: ::g"); then
-      # safe_gpu失败，使用CUDA_VISIBLE_DEVICES或默认值
-      gpus=${CUDA_VISIBLE_DEVICES:-"0"}
-      echo "Warning: safe_gpu failed, using CUDA_VISIBLE_DEVICES=${gpus}"
-    fi
-  else
-    # 非集群环境，直接使用默认GPU
-    gpus="0"
+     gpus=$(python -c "from sys import argv; from safe_gpu import safe_gpu; safe_gpu.claim_gpus(int(argv[1])); print( safe_gpu.gpu_owner.devices_taken )" $num_gpus | sed "s: ::g")
   fi
-  echo "GPUs: "
-  echo $gpus
-  # num_gpus=$(echo $gpus | awk -F ',' '{print NF}')
+    ##num_gpus=$(echo $gpus | awk -F ',' '{print NF}')
   # To avoid the randomly generated port is occuppied.
   while :
   do

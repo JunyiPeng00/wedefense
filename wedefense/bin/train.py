@@ -226,6 +226,13 @@ def train(config='conf/config.yaml', **kwargs):
                 'quantize_weights': True,  # quantize weights
                 'quantize_activations': False,  # quantize activations
                 'preserve_hp_gating': True,  # preserve HP framework gating
+                # Two-phase LSQ training knobs (can be overridden by YAML/CLI)
+                'freeze_lsq_steps': 2000,
+                'lsq_step_lr': 1e-5,
+                'grad_clip_norm': 1.0,
+                'per_channel_weights': True,
+                'per_channel_activations': False,
+                'quantize_bias': False,
             }
             for k, v in quantization_defaults.items():
                 configs.setdefault(k, v)
@@ -263,6 +270,11 @@ def train(config='conf/config.yaml', **kwargs):
                 quant_config.quantize_weights = True
             if configs.get('quantize_activations', False):
                 quant_config.quantize_activations = True
+            # enforce bias/per-channel from configs if provided
+            quant_config.per_channel_weights = configs.get('per_channel_weights', True)
+            quant_config.per_channel_activations = configs.get('per_channel_activations', False)
+            if 'quantize_bias' in configs:
+                quant_config.quantize_bias = configs['quantize_bias']
             
             # Apply quantization with HP integration
             pruning_config = {
@@ -422,7 +434,26 @@ def train(config='conf/config.yaml', **kwargs):
                 { 'params': ddp_model.parameters(), **{k:v for k,v in configs['optimizer_args'].items() if k != 'lr'}, 'lr': configs['optimizer_args']['lr'], 'name': 'main' }
             ]
 
-        optimizer = getattr(torch.optim, configs['optimizer'])(param_groups)
+        # Build optimizer with two-phase LSQ groups if quantization enabled
+        if use_quantization:
+            try:
+                from wedefense.frontend.wav2vec2.quantization_utils import build_two_phase_lsq_optimizer, collect_lsq_step_size_params
+                main_lr = configs['optimizer_args']['lr']
+                step_lr = configs.get('lsq_step_lr', main_lr)
+                base_opt_cls = getattr(torch.optim, configs['optimizer'])
+                optimizer = build_two_phase_lsq_optimizer(ddp_model, base_opt_cls, main_lr=main_lr, step_lr=step_lr, **{k:v for k,v in configs['optimizer_args'].items() if k != 'lr'})
+                if rank == 0:
+                    lsq_params = collect_lsq_step_size_params(ddp_model)
+                    lsq_cnt = len(lsq_params)
+                    main_cnt = sum(1 for _ in ddp_model.parameters()) - lsq_cnt
+                    logger.info(f"Added LSQ step_size param group: {lsq_cnt} params, lr={step_lr}")
+                    logger.info(f"Main param group: {main_cnt} params, lr={main_lr}")
+            except Exception as e:
+                if rank == 0:
+                    logger.warning(f"Falling back to single optimizer group due to error: {e}")
+                optimizer = getattr(torch.optim, configs['optimizer'])(param_groups)
+        else:
+            optimizer = getattr(torch.optim, configs['optimizer'])(param_groups)
     if rank == 0:
         logger.info("<== Optimizer ==>")
         logger.info("optimizer is: " + configs['optimizer'])
@@ -472,6 +503,22 @@ def train(config='conf/config.yaml', **kwargs):
     val_no_improvement_count = 0
     early_stop_patience = configs.get('early_stop_patience', 5)
     val_interval = configs.get('validate_interval', 1)
+
+    # Initialize two-phase LSQ controller if needed
+    lsq_controller = None
+    if use_quantization:
+        try:
+            from wedefense.frontend.wav2vec2.quantization_utils import TwoPhaseLSQController
+            lsq_controller = TwoPhaseLSQController(
+                model=ddp_model,
+                optimizer=optimizer,
+                freeze_steps=int(configs.get('freeze_lsq_steps', 2000)),
+                clip_norm=float(configs.get('grad_clip_norm', 1.0)),
+            )
+            configs['lsq_controller'] = lsq_controller
+        except Exception as e:
+            if rank == 0:
+                logger.warning(f"Could not initialize TwoPhaseLSQController: {e}")
 
     for epoch in range(start_epoch, configs['num_epochs'] + 1):
         train_dataset.set_epoch(epoch)

@@ -8,7 +8,7 @@
 #$ -q long.q@supergpu12,long.q@supergpu13,long.q@supergpu14,long.q@supergpu16,long.q@supergpu18
 #$ -pe smp 1
 #$ -l gpu_ram=15G,ram_free=10G,mem_free=10G,gpu=1
-#$ -t 1-4
+#$ -t 3-3
 
 source ~/.bashrc
 conda activate /mnt/matylda6/pengjy/python_new/miniconda/envs/wespeaker
@@ -20,13 +20,14 @@ SSLMODELs=(
         MHFA_wavlmbase_qua_w2
         MHFA_wavlmbase_qua_w4
         MHFA_wavlmbase_qua_w8
+        MHFA_wavlmbase_qua_w6
         )
 upstream=${SSLMODELs[$SGE_TASK_ID-1]} 
 
 # echo "[$(date)] Starting Job ID: $SLURM_JOB_ID" > logs/debug_$SLURM_JOB_ID.txt
 echo "[$(date)] Starting Job ID: $JOB_ID" > logs/debug_${JOB_ID}_${SGE_TASK_ID}.txt
 
-./run_qua.sh --stage 3 --stop_stage 3 --config conf/qua/${upstream}.yaml --exp_dir exp/qua/${upstream}
+./run_qua.sh --stage 3 --stop_stage 3 --config conf/qua/${upstream}.yaml --exp_dir exp/qua2/${upstream}
 
 # echo "[$(date)] Finished Job ID: $SLURM_JOB_ID" >> logs/debug_$SLURM_JOB_ID.txt
 echo "[$(date)] Finished Job ID: $JOB_ID" >> logs/debug_${JOB_ID}_${SGE_TASK_ID}.txt

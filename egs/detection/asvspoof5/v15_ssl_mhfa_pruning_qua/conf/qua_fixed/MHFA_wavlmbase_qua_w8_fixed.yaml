@@ -1,14 +1,14 @@
-### train configuraton
+### train configuraton - Fixed 8-bit quantization (baseline)
 
-exp_dir: exp/W2V2baseFrozen_MHFA-TSTP-emb256-fbank80-num_frms400-aug0-spFalse-saFalse-ArcMargin-SGD-epoch100
+exp_dir: exp/qua_fixed/MHFA_wavlmbase_qua_w8_fixed
 gpus: "[0,1]"
-num_avg: 2  
+num_avg: 2
 enable_amp: False # whether enable automatic mixed precision training
 
 seed: 42
-num_epochs: 5
-save_epoch_interval: 1 # save model every 5 epochs
-log_batch_interval: 100 # log every 100 batchs
+num_epochs: 10  # Increased for better convergence
+save_epoch_interval: 1 # save model every epoch
+log_batch_interval: 50 # log every 50 batches for more frequent monitoring
 
 dataloader_args:
   batch_size: 32
@@ -72,13 +72,20 @@ target_sparsity: 0.0
 initial_reg_lr: 5.0e-2
 sparsity_warmup_epochs: 5
 
+# FIXED: Quantization settings for 8-bit (baseline)
 use_quantization: True
-quantization_config: '4bit_symmetric_activations'  # 或 '4bit_symmetric', 'weights_only' 等
+quantization_config: '8bit_symmetric'  # 256 levels: {-128, -127, ..., 126, 127}
 quantize_weights: True
-quantize_bias: True
-quantize_activations: True
-preserve_hp_gating: True  #
+quantize_bias: False  # Keep bias unquantized for stability
+quantize_activations: False  # Keep activations unquantized
+preserve_hp_gating: True
 
+# FIXED: LSQ training parameters
+per_channel_weights: True  # Per-channel quantization for better accuracy
+per_channel_activations: False
+freeze_lsq_steps: 0  # No freezing - start training step_size immediately
+lsq_step_lr: 1.0e-4  # Increased from 1e-5 to match main learning rate
+grad_clip_norm: 1.0
 
 margin_scheduler: MarginScheduler
 margin_update:
@@ -96,10 +103,10 @@ optimizer: AdamW
 optimizer_args:
   weight_decay: 1.0e-7
 
-
+# FIXED: Learning rate schedule for 8-bit
 scheduler: ExponentialDecrease
 scheduler_args:
-  initial_lr: 1.0e-5 # 8.0e-3
-  final_lr: 1.0e-6 #4.4e-3 
-  warm_up_epoch: 2
+  initial_lr: 1.0e-3  # Standard learning rate for 8-bit
+  final_lr: 1.0e-5   # Gentle decay
+  warm_up_epoch: 2   # Standard warmup
   warm_from_zero: True
