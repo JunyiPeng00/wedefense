@@ -893,13 +893,38 @@ def _enable_hp_gating(model: nn.Module, pruning_config: Dict) -> None:
     """Enable Hard Concrete gating for structured pruning."""
     from .hardconcrete import HardConcrete
     from .components import ConvolutionalPositionalEmbedding
+    from .quantized_layers import QuantizedConv1d, QuantizedLinear
+    
+    def resolve_underlying_conv1d(module: nn.Module) -> Optional[nn.Conv1d]:
+        """Return an nn.Conv1d if this module or its field wraps one.
+        Supports both float modules (module.conv: nn.Conv1d) and quantized wrappers
+        (module.conv: QuantizedConv1d with .conv1d: nn.Conv1d).
+        """
+        # Common pattern in extractor blocks: module.conv may be Conv1d or QuantizedConv1d
+        conv_attr = getattr(module, 'conv', None)
+        if isinstance(conv_attr, nn.Conv1d):
+            return conv_attr
+        if isinstance(conv_attr, QuantizedConv1d):
+            return getattr(conv_attr, 'conv1d', None)
+        return None
+    
+    def resolve_underlying_linear(module: nn.Module, field_name: str) -> Optional[nn.Linear]:
+        """Return an nn.Linear from module.<field_name> for float or quantized wrapper.
+        Example field_name: 'intermediate_dense'.
+        """
+        dense = getattr(module, field_name, None)
+        if isinstance(dense, nn.Linear):
+            return dense
+        if isinstance(dense, QuantizedLinear):
+            return getattr(dense, 'linear', None)
+        return None
     
     for name, module in model.named_modules():
-        # Enable gating for convolutional layers
-        if (hasattr(module, 'conv') and isinstance(module.conv, nn.Conv1d) and 
-            not isinstance(module, ConvolutionalPositionalEmbedding)):
+        # Enable gating for convolutional layers (handle float and quantized)
+        conv1d = resolve_underlying_conv1d(module)
+        if conv1d is not None and not isinstance(module, ConvolutionalPositionalEmbedding):
             if not hasattr(module, 'hard_concrete') or module.hard_concrete is None:
-                out_channels = module.conv.out_channels
+                out_channels = conv1d.out_channels
                 module.hard_concrete = HardConcrete(n_in=out_channels, init_mean=0.01)
         
         # Enable gating for attention layers
@@ -911,14 +936,16 @@ def _enable_hp_gating(model: nn.Module, pruning_config: Dict) -> None:
             if not hasattr(module, 'hard_concrete_for_layer') or module.hard_concrete_for_layer is None:
                 module.hard_concrete_for_layer = HardConcrete(n_in=1, init_mean=0.01)
         
-        # Enable gating for feed-forward layers
-        elif hasattr(module, 'intermediate_dense') and isinstance(module.intermediate_dense, nn.Linear):
-            if not hasattr(module, 'hard_concrete_for_intermediate') or module.hard_concrete_for_intermediate is None:
-                intermediate_features = module.intermediate_dense.out_features
-                module.hard_concrete_for_intermediate = HardConcrete(n_in=intermediate_features, init_mean=0.5)
-            
-            if not hasattr(module, 'hard_concrete_for_layer') or module.hard_concrete_for_layer is None:
-                module.hard_concrete_for_layer = HardConcrete(n_in=1, init_mean=0.01)
+        # Enable gating for feed-forward layers (handle float and quantized)
+        elif hasattr(module, 'intermediate_dense'):
+            underlying_linear = resolve_underlying_linear(module, 'intermediate_dense')
+            if underlying_linear is not None:
+                if not hasattr(module, 'hard_concrete_for_intermediate') or module.hard_concrete_for_intermediate is None:
+                    intermediate_features = underlying_linear.out_features
+                    module.hard_concrete_for_intermediate = HardConcrete(n_in=intermediate_features, init_mean=0.5)
+                
+                if not hasattr(module, 'hard_concrete_for_layer') or module.hard_concrete_for_layer is None:
+                    module.hard_concrete_for_layer = HardConcrete(n_in=1, init_mean=0.01)
 
 
 def _setup_quantization_training(model: nn.Module, config: QuantizationConfig) -> None:
