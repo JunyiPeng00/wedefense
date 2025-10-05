@@ -21,7 +21,7 @@ import torch
 import torchnet as tnt
 
 from wedefense.dataset.dataset_utils import apply_cmvn, spec_aug
-from wedefense.utils.prune_utils import pruning_loss, get_progressive_sparsity
+from wedefense.utils.prune_utils import pruning_loss, get_progressive_sparsity, get_learning_rate_with_plateau_decay
 
 
 def train_epoch(dataloader,
@@ -77,6 +77,9 @@ def train_epoch(dataloader,
         warmup_epochs = configs.get('sparsity_warmup_epochs', 5)
         sparsity_schedule = configs.get('sparsity_schedule', 'cosine')
         min_sparsity = configs.get('min_sparsity', 0.0)
+        total_epochs = configs.get('num_epochs', 100)
+        total_iters = total_epochs * epoch_iter
+        plateau_start_ratio = configs.get('plateau_start_ratio', 0.9)
 
 
     frontend_type = configs['dataset_args'].get('frontend', 'fbank')
@@ -98,7 +101,9 @@ def train_epoch(dataloader,
                     total_warmup_iters=warmup_iters,
                     target_sparsity=target_sp,
                     schedule_type=sparsity_schedule,
-                    min_sparsity=min_sparsity
+                    min_sparsity=min_sparsity,
+                    total_iters=total_iters,
+                    plateau_start_ratio=plateau_start_ratio,
                 )
             else:
                 # Use final target sparsity after warmup
@@ -184,6 +189,20 @@ def train_epoch(dataloader,
                 l1.clamp_(min=0.0)  # Ensure lambda1 >= 0
         scaler.step(optimizer)
         scaler.update()
+
+        # Update learning rate with plateau decay if enabled
+        if configs.get('use_plateau_lr_decay', False):
+            cur_iter = (epoch - 1) * epoch_iter + i
+            new_lr = get_learning_rate_with_plateau_decay(
+                current_iter=cur_iter,
+                total_iters=total_iters,
+                initial_lr=configs.get('lr', 2e-4),
+                plateau_start_ratio=plateau_start_ratio,
+                decay_factor=configs.get('lr_decay_factor', 0.1),
+                min_lr_ratio=configs.get('min_lr_ratio', 0.01),
+            )
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = new_lr
 
         if (wandb_log):
             wandb_log.log({

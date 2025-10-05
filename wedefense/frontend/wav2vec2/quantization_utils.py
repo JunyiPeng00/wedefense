@@ -80,45 +80,59 @@ class QuantizationConfig:
         self.per_channel_activations = per_channel_activations
         self.exclude_modules = exclude_modules or []
         self.include_modules = include_modules
-
-
-def collect_lsq_step_size_params(model: nn.Module) -> List[nn.Parameter]:
-    """Collect all LSQ step_size parameters from a model.
-
-    This searches submodules for 'weight_quantizer' or 'activation_quantizer'
-    that expose a learnable 'step_size' parameter. Returns a de-duplicated list
-    of those Parameters that require gradients.
-
-    Args:
-        model: The model potentially containing LSQ quantizers
-
-    Returns:
-        List of Parameter objects corresponding to LSQ step sizes.
-    """
-    step_params: List[nn.Parameter] = []
-    for module in model.modules():
-        # weight quantizer
-        if hasattr(module, 'weight_quantizer') and module.weight_quantizer is not None:
-            q = module.weight_quantizer
-            if hasattr(q, 'step_size') and q.step_size is not None and isinstance(q.step_size, torch.nn.Parameter):
-                if q.step_size.requires_grad:
-                    step_params.append(q.step_size)
-        # activation quantizer
-        if hasattr(module, 'activation_quantizer') and module.activation_quantizer is not None:
-            q = module.activation_quantizer
-            if hasattr(q, 'step_size') and q.step_size is not None and isinstance(q.step_size, torch.nn.Parameter):
-                if q.step_size.requires_grad:
-                    step_params.append(q.step_size)
-
-    # de-duplicate
-    seen = set()
-    uniq: List[nn.Parameter] = []
-    for p in step_params:
-        pid = id(p)
-        if pid not in seen:
-            uniq.append(p)
-            seen.add(pid)
-    return uniq
+    
+    def should_quantize_module(self, module_name: str) -> bool:
+        """Check if a module should be quantized based on configuration.
+        
+        Args:
+            module_name: Name of the module
+            
+        Returns:
+            True if the module should be quantized
+        """
+        # Check if module is explicitly excluded
+        if any(excluded in module_name for excluded in self.exclude_modules):
+            return False
+        
+        # Check if only specific modules should be included
+        if self.include_modules is not None:
+            return any(included in module_name for included in self.include_modules)
+        
+        return True
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert configuration to dictionary.
+        
+        Returns:
+            Dictionary representation of the configuration
+        """
+        return {
+            'weight_bits': self.weight_bits,
+            'bias_bits': self.bias_bits,
+            'activation_bits': self.activation_bits,
+            'weight_symmetric': self.weight_symmetric,
+            'bias_symmetric': self.bias_symmetric,
+            'activation_symmetric': self.activation_symmetric,
+            'quantize_weights': self.quantize_weights,
+            'quantize_bias': self.quantize_bias,
+            'quantize_activations': self.quantize_activations,
+            'per_channel_weights': self.per_channel_weights,
+            'per_channel_activations': self.per_channel_activations,
+            'exclude_modules': self.exclude_modules,
+            'include_modules': self.include_modules
+        }
+    
+    @classmethod
+    def from_dict(cls, config_dict: Dict[str, Any]) -> 'QuantizationConfig':
+        """Create configuration from dictionary.
+        
+        Args:
+            config_dict: Dictionary containing configuration parameters
+            
+        Returns:
+            QuantizationConfig instance
+        """
+        return cls(**config_dict)
 
 
 def collect_lsq_step_size_params(model: nn.Module) -> List[nn.Parameter]:
@@ -236,9 +250,10 @@ class TwoPhaseLSQController:
         self.freeze_steps = int(max(0, freeze_steps))
         self.clip_norm = float(max(0.0, clip_norm))
         self._unfrozen: bool = self.freeze_steps == 0
-
-        if not self._unfrozen:
-            freeze_quantization_parameters(self.model)
+        
+        # Keep LSQ parameters always with requires_grad=True for static graph compatibility
+        # We will manually zero out gradients during the frozen phase instead
+        # This ensures the computation graph structure remains constant
 
     def maybe_unfreeze(self, global_step: int) -> None:
         """Unfreeze LSQ step sizes when reaching the boundary ``freeze_steps``.
@@ -247,8 +262,26 @@ class TwoPhaseLSQController:
             global_step: Current global optimization step (starting from 0 or 1, both ok).
         """
         if not self._unfrozen and global_step >= self.freeze_steps:
-            unfreeze_quantization_parameters(self.model)
+            # Mark as unfrozen - no need to change requires_grad
+            # Gradients will now be applied normally
             self._unfrozen = True
+
+    def zero_lsq_gradients_if_frozen(self) -> None:
+        """Zero out LSQ gradients during frozen phase for static graph compatibility.
+        
+        This should be called after backward() but before optimizer.step().
+        """
+        if not self._unfrozen:
+            for module in self.model.modules():
+                if hasattr(module, 'weight_quantizer') and module.weight_quantizer is not None:
+                    if hasattr(module.weight_quantizer, 'step_size') and module.weight_quantizer.step_size is not None:
+                        if module.weight_quantizer.step_size.grad is not None:
+                            module.weight_quantizer.step_size.grad.zero_()
+                
+                if hasattr(module, 'activation_quantizer') and module.activation_quantizer is not None:
+                    if hasattr(module.activation_quantizer, 'step_size') and module.activation_quantizer.step_size is not None:
+                        if module.activation_quantizer.step_size.grad is not None:
+                            module.activation_quantizer.step_size.grad.zero_()
 
     def clip_gradients(self) -> None:
         """Apply global norm gradient clipping if ``clip_norm > 0``."""
@@ -256,112 +289,6 @@ class TwoPhaseLSQController:
             clip_grad_norm_(self.model.parameters(), max_norm=self.clip_norm)
 
 
-class QuantizationConfig:
-    """Configuration class for model quantization.
-    
-    This class manages all quantization-related parameters and provides
-    a convenient interface for configuring quantization settings.
-    """
-    
-    def __init__(
-        self,
-        weight_bits: int = 8,
-        bias_bits: int = 8,
-        activation_bits: int = 8,
-        weight_symmetric: bool = True,
-        bias_symmetric: bool = True,
-        activation_symmetric: bool = True,
-        quantize_weights: bool = True,
-        quantize_bias: bool = True,
-        quantize_activations: bool = False,
-        per_channel_weights: bool = True,
-        per_channel_activations: bool = False,
-        exclude_modules: Optional[List[str]] = None,
-        include_modules: Optional[List[str]] = None
-    ):
-        """Initialize quantization configuration.
-        
-        Args:
-            weight_bits: Number of bits for weight quantization
-            bias_bits: Number of bits for bias quantization
-            activation_bits: Number of bits for activation quantization
-            weight_symmetric: Whether to use symmetric quantization for weights
-            bias_symmetric: Whether to use symmetric quantization for bias
-            activation_symmetric: Whether to use symmetric quantization for activations
-            quantize_weights: Whether to quantize weights
-            quantize_bias: Whether to quantize bias
-            quantize_activations: Whether to quantize activations
-            per_channel_weights: Whether to use per-channel quantization for weights
-            per_channel_activations: Whether to use per-channel quantization for activations
-            exclude_modules: List of module names to exclude from quantization
-            include_modules: List of module names to include in quantization (if None, all are included)
-        """
-        self.weight_bits = weight_bits
-        self.bias_bits = bias_bits
-        self.activation_bits = activation_bits
-        self.weight_symmetric = weight_symmetric
-        self.bias_symmetric = bias_symmetric
-        self.activation_symmetric = activation_symmetric
-        self.quantize_weights = quantize_weights
-        self.quantize_bias = quantize_bias
-        self.quantize_activations = quantize_activations
-        self.per_channel_weights = per_channel_weights
-        self.per_channel_activations = per_channel_activations
-        self.exclude_modules = exclude_modules or []
-        self.include_modules = include_modules
-    
-    def should_quantize_module(self, module_name: str) -> bool:
-        """Check if a module should be quantized based on configuration.
-        
-        Args:
-            module_name: Name of the module
-            
-        Returns:
-            True if the module should be quantized
-        """
-        # Check if module is explicitly excluded
-        if any(excluded in module_name for excluded in self.exclude_modules):
-            return False
-        
-        # Check if only specific modules should be included
-        if self.include_modules is not None:
-            return any(included in module_name for included in self.include_modules)
-        
-        return True
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert configuration to dictionary.
-        
-        Returns:
-            Dictionary representation of the configuration
-        """
-        return {
-            'weight_bits': self.weight_bits,
-            'bias_bits': self.bias_bits,
-            'activation_bits': self.activation_bits,
-            'weight_symmetric': self.weight_symmetric,
-            'bias_symmetric': self.bias_symmetric,
-            'activation_symmetric': self.activation_symmetric,
-            'quantize_weights': self.quantize_weights,
-            'quantize_bias': self.quantize_bias,
-            'quantize_activations': self.quantize_activations,
-            'per_channel_weights': self.per_channel_weights,
-            'per_channel_activations': self.per_channel_activations,
-            'exclude_modules': self.exclude_modules,
-            'include_modules': self.include_modules
-        }
-    
-    @classmethod
-    def from_dict(cls, config_dict: Dict[str, Any]) -> 'QuantizationConfig':
-        """Create configuration from dictionary.
-        
-        Args:
-            config_dict: Dictionary containing configuration parameters
-            
-        Returns:
-            QuantizationConfig instance
-        """
-        return cls(**config_dict)
 
 
 def quantize_model(
@@ -665,35 +592,19 @@ def create_quantization_aware_training_hooks(
 
 
 def freeze_quantization_parameters(model: nn.Module) -> None:
-    """Freeze quantization parameters (step sizes) to prevent further training.
+    """Deprecated: For static graph compatibility, use TwoPhaseLSQController.zero_lsq_gradients_if_frozen() instead.
     
-    Args:
-        model: Model with quantization parameters to freeze
+    This function is kept for backward compatibility but should not be used with static graph optimization.
     """
-    for module in model.modules():
-        if hasattr(module, 'weight_quantizer') and module.weight_quantizer is not None:
-            if hasattr(module.weight_quantizer, 'step_size') and module.weight_quantizer.step_size is not None:
-                module.weight_quantizer.step_size.requires_grad = False
-        
-        if hasattr(module, 'activation_quantizer') and module.activation_quantizer is not None:
-            if hasattr(module.activation_quantizer, 'step_size') and module.activation_quantizer.step_size is not None:
-                module.activation_quantizer.step_size.requires_grad = False
+    pass
 
 
 def unfreeze_quantization_parameters(model: nn.Module) -> None:
-    """Unfreeze quantization parameters to allow training.
+    """Deprecated: For static graph compatibility, use TwoPhaseLSQController instead.
     
-    Args:
-        model: Model with quantization parameters to unfreeze
+    This function is kept for backward compatibility but should not be used with static graph optimization.
     """
-    for module in model.modules():
-        if hasattr(module, 'weight_quantizer') and module.weight_quantizer is not None:
-            if hasattr(module.weight_quantizer, 'step_size') and module.weight_quantizer.step_size is not None:
-                module.weight_quantizer.step_size.requires_grad = True
-        
-        if hasattr(module, 'activation_quantizer') and module.activation_quantizer is not None:
-            if hasattr(module.activation_quantizer, 'step_size') and module.activation_quantizer.step_size is not None:
-                module.activation_quantizer.step_size.requires_grad = True
+    pass
 
 
 def apply_quantization(
@@ -891,6 +802,10 @@ def apply_quantization_with_hp_integration(
 
 def _enable_hp_gating(model: nn.Module, pruning_config: Dict) -> None:
     """Enable Hard Concrete gating for structured pruning."""
+    # Extract temperature annealing parameters from pruning_config
+    min_temperature = pruning_config.get('min_temperature', 0.1)
+    temperature_decay = pruning_config.get('temperature_decay', 0.95)
+    temperature_decay_freq = pruning_config.get('temperature_decay_freq', 100)
     from .hardconcrete import HardConcrete
     from .components import ConvolutionalPositionalEmbedding
     from .quantized_layers import QuantizedConv1d, QuantizedLinear
@@ -925,16 +840,34 @@ def _enable_hp_gating(model: nn.Module, pruning_config: Dict) -> None:
         if conv1d is not None and not isinstance(module, ConvolutionalPositionalEmbedding):
             if not hasattr(module, 'hard_concrete') or module.hard_concrete is None:
                 out_channels = conv1d.out_channels
-                module.hard_concrete = HardConcrete(n_in=out_channels, init_mean=0.01)
+                module.hard_concrete = HardConcrete(
+                    n_in=out_channels, 
+                    init_mean=0.01,
+                    min_temperature=min_temperature,
+                    temperature_decay=temperature_decay,
+                    temperature_decay_freq=temperature_decay_freq
+                )
         
         # Enable gating for attention layers
         elif hasattr(module, 'remaining_heads') and hasattr(module, 'total_num_heads'):
             if not hasattr(module, 'hard_concrete_for_heads') or module.hard_concrete_for_heads is None:
                 num_heads = len(module.remaining_heads)
-                module.hard_concrete_for_heads = HardConcrete(n_in=num_heads, init_mean=0.5)
+                module.hard_concrete_for_heads = HardConcrete(
+                    n_in=num_heads, 
+                    init_mean=0.5,
+                    min_temperature=min_temperature,
+                    temperature_decay=temperature_decay,
+                    temperature_decay_freq=temperature_decay_freq
+                )
             
             if not hasattr(module, 'hard_concrete_for_layer') or module.hard_concrete_for_layer is None:
-                module.hard_concrete_for_layer = HardConcrete(n_in=1, init_mean=0.01)
+                module.hard_concrete_for_layer = HardConcrete(
+                    n_in=1, 
+                    init_mean=0.01,
+                    min_temperature=min_temperature,
+                    temperature_decay=temperature_decay,
+                    temperature_decay_freq=temperature_decay_freq
+                )
         
         # Enable gating for feed-forward layers (handle float and quantized)
         elif hasattr(module, 'intermediate_dense'):
@@ -942,10 +875,22 @@ def _enable_hp_gating(model: nn.Module, pruning_config: Dict) -> None:
             if underlying_linear is not None:
                 if not hasattr(module, 'hard_concrete_for_intermediate') or module.hard_concrete_for_intermediate is None:
                     intermediate_features = underlying_linear.out_features
-                    module.hard_concrete_for_intermediate = HardConcrete(n_in=intermediate_features, init_mean=0.5)
+                    module.hard_concrete_for_intermediate = HardConcrete(
+                        n_in=intermediate_features, 
+                        init_mean=0.5,
+                        min_temperature=min_temperature,
+                        temperature_decay=temperature_decay,
+                        temperature_decay_freq=temperature_decay_freq
+                    )
                 
                 if not hasattr(module, 'hard_concrete_for_layer') or module.hard_concrete_for_layer is None:
-                    module.hard_concrete_for_layer = HardConcrete(n_in=1, init_mean=0.01)
+                    module.hard_concrete_for_layer = HardConcrete(
+                        n_in=1, 
+                        init_mean=0.01,
+                        min_temperature=min_temperature,
+                        temperature_decay=temperature_decay,
+                        temperature_decay_freq=temperature_decay_freq
+                    )
 
 
 def _setup_quantization_training(model: nn.Module, config: QuantizationConfig) -> None:
