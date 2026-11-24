@@ -1,0 +1,119 @@
+### Training run 2: fine-tuning from a checkpoint of run 1, with in-loader augmentation.
+### exp_dir, gpus, the data lists, noise_data and model_init are given by run.sh.
+
+num_avg: 0 # no model averaging: every epoch is kept, run.sh picks one
+enable_amp: True # mixed precision (float16)
+
+seed: 42
+num_epochs: 4
+save_epoch_interval: 1
+log_batch_interval: 100
+
+# batch_size x accum_grad x number of GPUs = 32 utterances per update (4 x 8 x 1)
+accum_grad: 8
+lr_scale_by_batch: False # initial_lr is used as written, not scaled by the batch size
+frontend_lr_split: True # the scheduler applies frontend_lr_ratio to the encoder
+ce_per_sample_fp32: True # cross-entropy per utterance on float32 logits, averaged over the batch
+ddp_grad_as_bucket_view: True
+
+# validation after every epoch: Macro-F1 at threshold 0.5 on as many random 4 s chunks as the list has
+# rows, drawn with repetition (with several GPUs: the share of the first one), without augmentation,
+# weighted over the groups (first component of the utterance key)
+validate_interval: 1
+val_fraction: 1.0
+val_augment: False
+val_metric: weighted_macro_f1 # selects best_model.pt and drives early stopping
+val_group_weights:
+  online: 0.3
+  reverb_noise: 0.35
+  reverb: 0.35
+early_stop_patience: 3
+
+dataloader_args:
+  batch_size: 4
+  num_workers: 4
+  pin_memory: False
+  prefetch_factor: 4
+  drop_last: True
+
+dataset_args:
+  # samples per epoch (not one pass over the list); the list is reshuffled every epoch
+  sample_num_per_epoch: 132813
+  shuffle: True
+  shuffle_args:
+    shuffle_size: 2500
+  filter: True # drop utterances below 1 s, cut a random 12 s from longer ones
+  filter_args:
+    min_num_frames: 50
+    max_num_frames: 600
+  resample_rate: 16000
+  speed_perturb: False
+  num_frms: 200 # random 4 s chunk; shorter utterances are repeated
+  aug_prob: 0 # no reverb & noise mixing
+  frontend: "w2vbert"
+  w2vbert_args:
+    model_path: pretrained_models/w2v-bert-2.0 # config.json, preprocessor_config.json, model.safetensors
+    frozen: False
+    gpu_fbank: True # input features computed on the GPU
+    frame_shift: 20
+    frame_length: 20
+  cmvn: True
+  cmvn_args:
+    norm_mean: True
+    norm_var: False
+  spec_aug: False
+  # sparse sound events and clipping
+  event_aug: True
+  event_plan: conf/event_plan.json # its scp paths are relative to the recipe directory and assume --data data
+  event_prob: 0.3
+  event_snr: [6, 18]
+  event_clip_prob: 0.1
+  event_clip_gain_db: [1, 4]
+  # codec (FFmpeg through torchaudio)
+  codec_aug: True
+  codec_seed: null # do not reseed the random generator when the stage starts
+  codec_formats: ["ogg-opus", "g722", "mu-law"]
+  codec_prob: 0.5
+  # 1-2 of: band limit, Opus packet loss, pitch shift, time mask, noise from noise_data
+  diverse_aug: True
+  diverse_prob: 0.5
+  diverse_n_ops: [1, 2]
+  diverse_noise: True
+  diverse_noise_snr: [5, 30]
+
+model: SSL_BACKEND_MHFA
+model_init: null # run.sh: encoder and back-end are loaded, the 2-class head starts from scratch
+model_args:
+  feat_dim: 1024
+  head_nb: 32
+  embed_dim: 256
+  compression_dim: 128
+  feature_grad_mult: 1.0
+  nb_layer: 25 # the input of the first encoder layer and the outputs of the 24 layers
+projection_args:
+  project_type: "softmax" # BatchNorm1d, ReLU, Linear
+
+margin_scheduler: MarginScheduler # required by train.py, without effect on the softmax head
+margin_update:
+  initial_margin: 0.0
+  final_margin: 0.0
+  increase_start_epoch: 20
+  fix_start_epoch: 40
+  update_margin: True
+  increase_type: "exp"
+
+loss: CrossEntropyLoss
+loss_args: {}
+
+optimizer: AdamW
+optimizer_args:
+  weight_decay: 0.0001
+
+scheduler: ExponentialDecrease
+scheduler_args:
+  initial_lr: 0.00005
+  final_lr: 0.000001
+  warm_up_epoch: 1
+  warm_from_zero: True
+  frontend_modules: ["frontend"]
+  frontend_lr_ratio: 0.05 # the encoder is trained with initial_lr x 0.05

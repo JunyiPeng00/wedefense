@@ -70,6 +70,8 @@ def extract(config='conf/config.yaml', **kwargs):
     test_conf['aug_prob'] = configs.get('aug_prob', 0.0)
     test_conf['filter'] = False
     test_conf['codec_aug'] = False
+    test_conf['event_aug'] = False
+    test_conf['diverse_aug'] = False
     test_conf['rawboost'] = False
 
     dataset = Dataset(configs['data_type'],

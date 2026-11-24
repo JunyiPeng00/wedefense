@@ -15,6 +15,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
+import logging
+
 import tableprint as tp
 import torch
 import torchnet as tnt
@@ -60,6 +63,7 @@ def train_epoch(dataloader,
     acc_meter = tnt.meter.ClassErrorMeter(accuracy=True)
 
     frontend_type = configs['dataset_args'].get('frontend', 'fbank')
+    nan_batches = 0
     for i, batch in enumerate(dataloader):
         cur_iter = (epoch - 1) * epoch_iter + i
         scheduler.step(cur_iter)
@@ -96,16 +100,46 @@ def train_epoch(dataloader,
             else:
                 loss = criterion(outputs, targets)
 
+            if configs.get('ce_per_sample_fp32', False):
+                # replaces the criterion value: plain cross-entropy per
+                # sample on float32 logits, mean over the batch
+                loss = torch.nn.functional.cross_entropy(
+                    outputs.float(), targets, reduction='none').mean()
+
+        # a non-finite loss on any rank: every rank drops the gradients
+        finite = torch.isfinite(loss.detach()).float()
+        if torch.distributed.is_available(
+        ) and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(finite,
+                                         op=torch.distributed.ReduceOp.MIN)
+        if finite.item() < 1:
+            nan_batches += 1
+            if nan_batches <= 20:
+                logging.warning(
+                    "non-finite loss at epoch %d batch %d; keys=%s", epoch, i,
+                    str(batch.get('key', batch.get('keys', '?')))[:300])
+            optimizer.zero_grad()
+            continue
+
         # loss, acc
         loss_meter.add(loss.item())
-        acc_meter.add(outputs.cpu().detach().numpy(), targets.cpu().numpy())
+        acc_meter.add(outputs.float().cpu().detach().numpy(),
+                      targets.cpu().numpy())
 
-        # update the model
-        optimizer.zero_grad()
-        # scaler does nothing here if enable_amp=False
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+        # update the model every accum_grad batches
+        accum = int(configs.get('accum_grad', 1))
+        if i % accum == 0:
+            optimizer.zero_grad()
+        step_now = (i + 1) % accum == 0 or (i + 1) == epoch_iter
+        # no gradient synchronisation between ranks before the step
+        sync_ctx = contextlib.nullcontext() if (
+            step_now or not hasattr(model, 'no_sync')) else model.no_sync()
+        with sync_ctx:
+            # scaler does nothing here if enable_amp=False
+            scaler.scale(loss / accum).backward()
+        if step_now:
+            scaler.step(optimizer)
+            scaler.update()
 
         if (wandb_log):
             wandb_log.log({
@@ -140,7 +174,9 @@ def val_epoch(val_dataloader,
               criterion,
               device,
               configs,
-              wandb_log=None):
+              wandb_log=None,
+              spoof_id=None,
+              return_metrics=False):
     """Validate the model on the validation set.
 
     Args:
@@ -149,13 +185,17 @@ def val_epoch(val_dataloader,
         criterion: Loss criterion
         device: Device to run validation on
         configs: Configuration dictionary
+        spoof_id: Index of the spoof class
+        return_metrics: Also return val_metrics() of the spoof posteriors
 
     Returns:
-        tuple: (validation loss, validation accuracy)
+        tuple: (validation loss, validation accuracy[, val_metrics() dict])
     """
     model.eval()
     val_loss_meter = tnt.meter.AverageValueMeter()
     val_acc_meter = tnt.meter.ClassErrorMeter(accuracy=True)
+    # per-utterance spoof posteriors, for Macro-F1 at threshold 0.5
+    v_keys, v_prob, v_true = [], [], []
 
     frontend_type = configs['dataset_args'].get('frontend', 'fbank')
     with torch.no_grad():
@@ -190,8 +230,13 @@ def val_epoch(val_dataloader,
 
             # loss, acc
             val_loss_meter.add(loss.item())
-            val_acc_meter.add(outputs.cpu().detach().numpy(),
+            val_acc_meter.add(outputs.float().cpu().detach().numpy(),
                               targets.cpu().numpy())
+            if return_metrics and spoof_id is not None:
+                probs = torch.softmax(outputs.float(), dim=-1)[:, spoof_id]
+                v_prob.extend(probs.cpu().tolist())
+                v_true.extend((targets == spoof_id).long().cpu().tolist())
+                v_keys.extend(list(batch.get('key', [''] * len(probs))))
             if (wandb_log):
                 wandb_log.log({
                     "val/loss": val_loss_meter.value()[0],
@@ -201,4 +246,52 @@ def val_epoch(val_dataloader,
             if (i + 1) == val_iter:
                 break
 
-    return val_loss_meter.value()[0], val_acc_meter.value()[0]
+    if not return_metrics:
+        return val_loss_meter.value()[0], val_acc_meter.value()[0]
+    return (val_loss_meter.value()[0], val_acc_meter.value()[0],
+            val_metrics(v_keys, v_prob, v_true,
+                        configs.get('val_group_weights')))
+
+
+def val_metrics(keys, prob_spoof, is_spoof, group_weights=None, threshold=0.5):
+    """Macro-F1 at a fixed threshold, overall and weighted over groups.
+
+    Args:
+        keys: utterance keys
+        prob_spoof: P(spoof) per utterance
+        is_spoof: reference per utterance (1 = spoof)
+        group_weights: {group: weight}; the group of an utterance is the
+            first path component of its key. Groups without utterances are
+            skipped and the weights renormalised.
+
+    Returns:
+        dict: 'macro_f1', 'groups' {group: (count, Macro-F1)} and
+            'weighted_macro_f1' (the overall value if there is no group)
+    """
+    from sklearn.metrics import f1_score
+    import numpy as np
+    if not prob_spoof:
+        return {}
+    p = np.asarray(prob_spoof)
+    y = np.asarray(is_spoof)
+    pred = (p >= threshold).astype(int)
+    out = {'macro_f1': float(f1_score(y, pred, average='macro', labels=[0, 1]))}
+    groups = {}
+    if group_weights:
+        for k, yy, pp in zip(keys, y, pred):
+            g = str(k).split('/')[0]
+            if g in group_weights:
+                groups.setdefault(g, [[], []])
+                groups[g][0].append(yy)
+                groups[g][1].append(pp)
+    if groups:
+        wsum, acc = 0.0, 0.0
+        for g, (yy, pp) in groups.items():
+            f = float(f1_score(yy, pp, average='macro', labels=[0, 1]))
+            out.setdefault('groups', {})[g] = (len(yy), round(f, 4))
+            acc += group_weights[g] * f
+            wsum += group_weights[g]
+        out['weighted_macro_f1'] = acc / wsum
+    else:
+        out['weighted_macro_f1'] = out['macro_f1']
+    return out

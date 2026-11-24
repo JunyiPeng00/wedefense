@@ -1,0 +1,7 @@
+[
+  {"name": "keyboard", "scp": "data/noise/keyboard.scp", "prob": 0.08, "event_len_ms": [40, 160], "rate_hz": [6, 14],
+   "burst": {"len_s": [1.0, 4.0], "gap_s": [1.0, 6.0]}},
+  {"name": "footsteps", "scp": "data/noise/footsteps.scp", "prob": 0.13, "event_len_ms": [100, 400], "rate_hz": [1.0, 3.0]},
+  {"name": "birds", "scp": "data/noise/birds.scp", "prob": 0.09, "event_len_ms": [300, 1500], "rate_hz": [0.3, 1.0]},
+  {"name": "kitchen", "scp": "data/noise/kitchen.scp", "prob": 0.03, "event_len_ms": [300, 2000], "rate_hz": [0.2, 0.6]}
+]

@@ -16,6 +16,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import io
 import kaldiio
 import json
@@ -35,6 +36,8 @@ import torchaudio.transforms as torchaudio_T
 
 import wedefense.dataset.augmentation.rawboost_util as rawboost_util
 import wedefense.dataset.augmentation.codec_util as codec_util
+import wedefense.dataset.augmentation.event_util as event_util
+import wedefense.dataset.augmentation.opus_util as opus_util
 
 import lmdb
 
@@ -668,19 +671,29 @@ def rawboost(data, algo=5):
         yield sample
 
 
-def codec(data, random_seed=42):
+def codec(data, random_seed=42, formats=None, prob=1.0):
     """ Process codec
 
         Args:
             data: Iterable[{key, wav, label, sample_rate}]
-            random_seed (int): random seed for random(), default 42
+            random_seed (int): random seed for random(), default 42;
+                None leaves the random generator as it is
+            formats (list): codecs to draw from, default
+                codec_util.SUPPORTED_CODEC_FOR_AUGMENTATION
+            prob (float): probability of coding a sample
 
         Returns:
             Iterable[{key, wav, label, sample_rate}]
     """
-    random.seed(random_seed)
+    if random_seed is not None:
+        random.seed(random_seed)
+    choices = list(
+        formats) if formats else codec_util.SUPPORTED_CODEC_FOR_AUGMENTATION
 
     for sample in data:
+        if prob < 1.0 and random.random() >= prob:
+            yield sample
+            continue
         assert 'sample_rate' in sample
         assert 'wav' in sample
         assert 'key' in sample
@@ -688,11 +701,209 @@ def codec(data, random_seed=42):
         sr = sample['sample_rate']
         audio = sample['wav']
 
-        codec_name = random.choice(codec_util.SUPPORTED_CODEC_FOR_AUGMENTATION)
+        codec_name = random.choice(choices)
         bitrate = random.choice(codec_util.SUPPORTED_CODEC_CONFIG[codec_name])
 
         sample['wav'] = codec_util.codec_apply(audio, sr, codec_name, bitrate)
         # print(codec_name, bitrate, audio.shape, sample['wav'].shape, type(audio), type(sample['wav']))  # noqa
+        yield sample
+
+
+def event_aug(data,
+              plan_path,
+              prob=0.3,
+              snr_range=(6, 18),
+              clip_prob=0.1,
+              clip_gain_db=(1, 4),
+              max_cache=64):
+    """ Add the sparse sound events of one family, and clip, independently
+        of each other
+
+        Args:
+            data: Iterable[{key, wav, label, sample_rate}], 16 kHz
+            plan_path: JSON list of event families, see event_util.load_plan
+            prob: probability of adding events
+            snr_range: range of the local event SNR in dB
+            clip_prob: probability of clipping
+            clip_gain_db: range of the gain above full scale in dB
+            max_cache: number of decoded event files kept per worker
+
+        Returns:
+            Iterable[{key, wav, label, sample_rate}]
+    """
+    families = event_util.load_plan(plan_path)
+    weights = [family['prob'] for family in families]
+    loader = functools.lru_cache(maxsize=max_cache)(event_util.load_audio16)
+    # seeded when the worker builds the pipeline, before the first sample
+    rng = np.random.default_rng(random.getrandbits(32))
+
+    def generate():
+        for sample in data:
+            event = prob > 0 and random.random() < prob
+            clip = clip_prob > 0 and random.random() < clip_prob
+            if not event and not clip:
+                yield sample
+                continue
+            x = sample['wav'].detach().cpu().numpy()[0].astype(np.float32,
+                                                               copy=False)
+            if event:
+                family = random.choices(families, weights=weights, k=1)[0]
+                x = event_util.add_events(x, dict(family, snr=snr_range), rng,
+                                          loader)
+            if clip:
+                gain = random.uniform(*clip_gain_db)
+                peak = float(np.max(np.abs(x)))
+                if peak > 0:
+                    x = np.clip((x / peak) * 10**(gain / 20), -1, 1)
+            sample['wav'] = torch.from_numpy(np.asarray(
+                x, dtype=np.float32)).unsqueeze(0)
+            yield sample
+
+    return generate()
+
+
+_AUG_FAILURES = {}
+
+
+def _aug_failure(name, ex, limit=5):
+    """ Log the first failure of an augmentation in this worker; the sample
+        is passed through. The worker stops at the `limit`-th failure.
+    """
+    n = _AUG_FAILURES.get(name, 0) + 1
+    _AUG_FAILURES[name] = n
+    if n == 1:
+        logging.warning(
+            '%s: augmentation failed (%s: %s); the sample is passed through',
+            name,
+            type(ex).__name__,
+            str(ex)[:200])
+    if n >= limit:
+        raise RuntimeError(
+            f'{name}: {n} augmentation failures in this worker (last: {type(ex).__name__}: {str(ex)[:200]})'
+        )
+
+
+def _pitch_shift(x, semitones, sr=16000):
+    """ Pitch shift by `semitones`, length preserved """
+    import librosa
+    y = librosa.effects.pitch_shift(x.astype(np.float32),
+                                    sr=sr,
+                                    n_steps=float(semitones),
+                                    bins_per_octave=12)
+    n = len(x)
+    return (y[:n] if len(y) >= n else np.pad(y, (0, n - len(y)))).astype(
+        np.float32)
+
+
+def diverse_aug(data,
+                prob=0.5,
+                n_ops=(1, 2),
+                noise_source=None,
+                sample_rate=16000,
+                lp_range=(2200, 7200),
+                hp_range=(70, 360),
+                loss_range=(1, 10),
+                pitch_semitones=1.0,
+                mask_frac=(0.01, 0.10),
+                noise_snr=(5, 30),
+                ops=('bandlimit', 'packetloss', 'pitch', 'timemask', 'noise')):
+    """ With probability `prob` apply n_ops random operations out of:
+        band limit (low-pass 2.2-7.2 kHz | high-pass 70-360 Hz | band-pass
+        300-4000 Hz), Opus coding with 1-10 % bursty packet loss concealed by
+        the decoder, pitch shift within one semitone, a zeroed span of 1-10 %
+        of the samples, noise at 5-30 dB from the noise LMDB
+
+        Args:
+            data: Iterable[{key, wav, label, sample_rate}]
+            prob: probability of augmenting a sample
+            n_ops: range of the number of operations
+            noise_source: LmdbData of noise files (keys starting with
+                'speech' are skipped); without it there is no noise operation
+            noise_snr: SNR range of the noise in dB
+
+        Returns:
+            Iterable[{key, wav, label, sample_rate}]
+    """
+    ops = list(ops)
+    if noise_source is None:
+        ops = [o for o in ops if o != 'noise']
+    for sample in data:
+        if random.random() >= prob:
+            yield sample
+            continue
+        wav = sample['wav']
+        x = wav[0].detach().cpu().numpy().astype(np.float32)
+        T = len(x)
+        k = random.randint(n_ops[0], n_ops[1])
+        chosen = random.sample(ops, min(k, len(ops)))
+        try:
+            for op in chosen:
+                if op == 'bandlimit':
+                    kind = random.choice(['lp', 'hp', 'bp'])
+                    if kind == 'lp':
+                        sos = signal.butter(6,
+                                            random.uniform(*lp_range),
+                                            'lowpass',
+                                            fs=sample_rate,
+                                            output='sos')
+                    elif kind == 'hp':
+                        sos = signal.butter(4,
+                                            random.uniform(*hp_range),
+                                            'highpass',
+                                            fs=sample_rate,
+                                            output='sos')
+                    else:
+                        sos = signal.butter(4, [300, 4000],
+                                            'bandpass',
+                                            fs=sample_rate,
+                                            output='sos')
+                    x = signal.sosfilt(sos, x).astype(np.float32)
+                elif op == 'packetloss':
+                    rng = np.random.default_rng(random.getrandbits(32))
+                    # target loss rate
+                    L = random.uniform(*loss_range) / 100.0
+                    # a lost packet is followed by another one with
+                    # probability 0.5: entering a loss with r % gives L
+                    r = 100.0 * 0.5 * L / (1.0 - L)
+                    x = opus_util.opus_packet_loss(
+                        x, int(rng.integers(12000, 32001)), float(r),
+                        rng).astype(np.float32)
+                elif op == 'pitch':
+                    x = _pitch_shift(
+                        x, random.uniform(-pitch_semitones, pitch_semitones),
+                        sample_rate)
+                elif op == 'timemask':
+                    L = int(random.uniform(*mask_frac) * T)
+                    s = random.randint(0, max(0, T - L))
+                    x = x.copy()
+                    x[s:s + L] = 0.0
+                elif op == 'noise':
+                    key, nd = noise_source.random_one()
+                    tries = 0
+                    while key.startswith('speech') and tries < 20:
+                        key, nd = noise_source.random_one()
+                        tries += 1
+                    if key.startswith('speech'):
+                        continue
+                    nsr, na = wavfile.read(io.BytesIO(nd))
+                    na = na.astype(np.float32) / (1 << 15)
+                    if nsr != sample_rate:
+                        na = get_random_chunk(na, int(T / sample_rate * nsr))
+                        na = signal.resample(na, T)
+                    else:
+                        na = get_random_chunk(na, T)
+                    snr = random.uniform(*noise_snr)
+                    pa = np.mean(x**2) + 1e-8
+                    pn = np.mean(na**2) + 1e-8
+                    x = x + na * np.sqrt(pa / pn / (10**(snr / 10)))
+        except Exception as ex:
+            _aug_failure('diverse_aug', ex)
+            yield sample
+            continue
+        if len(x) < T:
+            x = np.concatenate([x, np.zeros(T - len(x), dtype=np.float32)])
+        x = np.clip(x[:T], -1.0, 1.0).astype(np.float32)
+        sample['wav'] = torch.from_numpy(x).unsqueeze(0).to(wav.dtype)
         yield sample
 
 

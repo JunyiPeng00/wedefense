@@ -1,0 +1,14 @@
+# <subset> <preset> <seed>: one rendering of the offline recordings of <subset>
+# (train | dev) with local/simulate_rtc.py --preset <preset> --seed <seed>
+train noise        11
+train noise_hard   12
+train reverb_noise 51
+train reverb       52
+train event        63
+train event_soft   64
+dev   noise        7
+dev   noise_hard   8
+dev   reverb_noise 45
+dev   reverb       46
+dev   event        62
+dev   event_strong 55

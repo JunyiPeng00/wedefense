@@ -15,6 +15,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
+import json
 import os
 import re
 from pprint import pformat
@@ -165,7 +167,9 @@ def train(config='conf/config.yaml', **kwargs):
         val_label = configs['val_label']
         val_utt_lab_list = read_table(val_label)
         val_lines = len(val_utt_lab_list)
-        val_iter = val_lines // 2 // world_size // batch_size
+        # share of the validation list read per validation
+        val_fraction = float(configs.get('val_fraction', 0.5))
+        val_iter = int(val_lines * val_fraction) // world_size // batch_size
 
         if rank == 0:
             logger.info("validation data num: {}".format(
@@ -173,14 +177,25 @@ def train(config='conf/config.yaml', **kwargs):
 
         val_dur = os.path.join(os.path.dirname(val_label), 'utt2dur')
 
+        val_dataset_args = configs['dataset_args']
+        val_reverb_data = configs.get('reverb_data', None)
+        val_noise_data = configs.get('noise_data', None)
+        if not configs.get('val_augment', True):
+            # validate on the audio as it is
+            val_dataset_args = copy.deepcopy(configs['dataset_args'])
+            for key in ('rawboost', 'codec_aug', 'spec_aug', 'speed_perturb',
+                        'event_aug', 'diverse_aug'):
+                val_dataset_args[key] = False
+            val_dataset_args['aug_prob'] = 0
+            val_reverb_data = val_noise_data = None
         val_dataset = Dataset(
             configs['data_type'],
             configs['val_data'],
-            configs['dataset_args'],
+            val_dataset_args,
             lab2id_dict,
-            whole_utt=configs['dataset_args'].get('whole_utt'),
-            reverb_lmdb_file=configs.get('reverb_data', None),
-            noise_lmdb_file=configs.get('noise_data', None),
+            whole_utt=val_dataset_args.get('whole_utt'),
+            reverb_lmdb_file=val_reverb_data,
+            noise_lmdb_file=val_noise_data,
             data_dur_file=val_dur,
             block_shuffle_size=block_shuffle_size)
 
@@ -278,7 +293,11 @@ def train(config='conf/config.yaml', **kwargs):
 
     # ddp_model
     model.cuda()
-    ddp_model = torch.nn.parallel.DistributedDataParallel(model)
+    # gradient_as_bucket_view: no second copy of the gradients on the GPU
+    ddp_model = torch.nn.parallel.DistributedDataParallel(
+        model,
+        gradient_as_bucket_view=bool(
+            configs.get('ddp_grad_as_bucket_view', False)))
     device = torch.device("cuda")
 
     criterion = getattr(torch.nn, configs['loss'])(**configs['loss_args'])
@@ -287,9 +306,10 @@ def train(config='conf/config.yaml', **kwargs):
         logger.info("loss criterion is: " + configs['loss'])
 
     configs['optimizer_args']['lr'] = configs['scheduler_args']['initial_lr']
-    optimizer = getattr(torch.optim,
-                        configs['optimizer'])(ddp_model.parameters(),
-                                              **configs['optimizer_args'])
+    # only the trainable parameters enter the optimizer
+    optimizer = getattr(torch.optim, configs['optimizer'])(
+        [p for p in ddp_model.parameters() if p.requires_grad],
+        **configs['optimizer_args'])
     if rank == 0:
         logger.info("<== Optimizer ==>")
         logger.info("optimizer is: " + configs['optimizer'])
@@ -302,12 +322,31 @@ def train(config='conf/config.yaml', **kwargs):
     # adjusted according to the batchsize and world_size used in different setup
     configs['scheduler_args']['scale_ratio'] = 1.0 * world_size * configs[
         'dataloader_args']['batch_size'] / 64
-    scheduler = getattr(schedulers,
-                        configs['scheduler'])(optimizer,
-                                              **configs['scheduler_args'])
+    # lr_scale_by_batch: False uses initial_lr as it is written
+    if not configs.get('lr_scale_by_batch', True):
+        configs['scheduler_args']['scale_ratio'] = 1.0
+    sched_kwargs = dict(configs['scheduler_args'])
+    # frontend_lr_split: the scheduler gets the model and applies
+    # frontend_lr_ratio to the parameters of frontend_modules
+    if configs.get('frontend_lr_split', False):
+        sched_kwargs['model'] = model
+    scheduler = getattr(schedulers, configs['scheduler'])(optimizer,
+                                                          **sched_kwargs)
     if rank == 0:
         logger.info("<== Scheduler ==>")
         logger.info("scheduler is: " + configs['scheduler'])
+        n_fe = sum(p.numel() for g in optimizer.param_groups
+                   if g.get('_is_frontend') for p in g['params'])
+        n_be = sum(p.numel() for g in optimizer.param_groups
+                   if not g.get('_is_frontend') for p in g['params'])
+        logger.info(
+            "param groups: frontend %.1fM (lr x%s)  backend %.1fM  "
+            "peak lr %.3g  scale_ratio %.3g  accum_grad %d", n_fe / 1e6,
+            sched_kwargs.get('frontend_lr_ratio', 1.0), n_be / 1e6,
+            configs['scheduler_args']['initial_lr'] *
+            configs['scheduler_args']['scale_ratio'],
+            configs['scheduler_args']['scale_ratio'],
+            configs.get('accum_grad', 1))
 
     # margin scheduler
     configs['margin_update']['epoch_iter'] = epoch_iter
@@ -332,7 +371,10 @@ def train(config='conf/config.yaml', **kwargs):
     dist.barrier(device_ids=[gpu])  # synchronize here
 
     scaler = torch.cuda.amp.GradScaler(enabled=configs['enable_amp'])
-    best_val_acc = float('-inf')
+    best_val_score = float('-inf')
+    # acc | loss | macro_f1 | weighted_macro_f1 (executor.val_metrics)
+    val_metric = configs.get('val_metric', 'acc')
+    spoof_id = lab2id_dict.get('spoof', None)
     val_no_improvement_count = 0
     early_stop_patience = configs.get('early_stop_patience', 5)
     val_interval = configs.get('validate_interval', 1)
@@ -354,24 +396,58 @@ def train(config='conf/config.yaml', **kwargs):
                     configs,
                     wandb_log=wandb_run)
 
+        if rank == 0:
+            logger.info(
+                "Epoch %d peak GPU memory: %.2f GiB allocated / %.2f GiB reserved",
+                epoch,
+                torch.cuda.max_memory_allocated() / 2**30,
+                torch.cuda.max_memory_reserved() / 2**30)
+
+        stop_training = False
         if val_dataloader is not None and (epoch - 1) % val_interval == 0:
-            val_loss, val_acc = val_epoch(val_dataloader,
-                                          val_iter,
-                                          ddp_model,
-                                          criterion,
-                                          device,
-                                          configs,
-                                          wandb_log=wandb_run)
+            val_loss, val_acc, val_m = val_epoch(val_dataloader,
+                                                 val_iter,
+                                                 ddp_model,
+                                                 criterion,
+                                                 device,
+                                                 configs,
+                                                 wandb_log=wandb_run,
+                                                 spoof_id=spoof_id,
+                                                 return_metrics=True)
+            score = {
+                'acc': val_acc,
+                'loss': -val_loss,
+                'macro_f1': val_m.get('macro_f1', float('nan')),
+                'weighted_macro_f1': val_m.get('weighted_macro_f1',
+                                               float('nan'))
+            }[val_metric]
             if rank == 0:
                 logger.info(
-                    f"Validation - Epoch: {epoch}, Loss: {val_loss:.4f}, Acc: {val_acc:.4f}"
+                    f"Validation - Epoch: {epoch}, Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, "
+                    f"MacroF1@0.5: {val_m.get('macro_f1', float('nan')):.4f}, "
+                    f"weighted: {val_m.get('weighted_macro_f1', float('nan')):.4f} "
+                    f"groups: {val_m.get('groups', {})}  [{val_metric}={score:.4f}]"
                 )
+                with open(os.path.join(configs['exp_dir'], 'val_metrics.jsonl'),
+                          'a') as fh:
+                    fh.write(
+                        json.dumps(
+                            dict(epoch=epoch,
+                                 loss=val_loss,
+                                 acc=val_acc,
+                                 macro_f1=val_m.get('macro_f1'),
+                                 weighted_macro_f1=val_m.get(
+                                     'weighted_macro_f1'),
+                                 groups=val_m.get('groups'),
+                                 metric=val_metric,
+                                 score=score)) + '\n')
 
-                if val_acc >= best_val_acc:
-                    best_val_acc = val_acc
+                if score >= best_val_score:
+                    best_val_score = score
                     val_no_improvement_count = 0
                     logger.info(
-                        f"New best validation accuracy: {best_val_acc:.6f}")
+                        f"New best validation {val_metric}: {best_val_score:.6f}"
+                    )
                     save_checkpoint(model,
                                     os.path.join(model_dir, 'best_model.pt'))
                 else:
@@ -384,7 +460,15 @@ def train(config='conf/config.yaml', **kwargs):
                             f"Early stopping triggered after {epoch} epochs")
                         save_checkpoint(model,
                                         os.path.join(model_dir, 'final.pt'))
-                        break
+                        stop_training = True
+            # rank 0 decides, every rank has to leave the loop
+            if world_size > 1:
+                flag = torch.tensor([int(stop_training)],
+                                    device=torch.device('cuda', gpu))
+                dist.broadcast(flag, src=0)
+                stop_training = bool(flag.item())
+        if stop_training:
+            break
 
         if rank == 0:
             if epoch % configs['save_epoch_interval'] == 0 or epoch > configs[

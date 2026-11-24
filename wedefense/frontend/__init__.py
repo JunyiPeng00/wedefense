@@ -18,6 +18,8 @@ from .get_hf_ssl_pruning import HuggingfaceFrontend
 from .get_hf_dasheng import HuggingfaceFrontend_Dasheng
 from .get_local_beats import LocalFrontend_Beats
 from .get_hf_eat import HuggingfaceFrontend_Eat
+from .get_w2vbert import W2vBertFrontend
+from .get_hf_wav2vec2 import HfWav2Vec2Frontend
 
 frontend_class_dict = {
     'fbank': None,
@@ -26,5 +28,7 @@ frontend_class_dict = {
     'huggingface': HuggingfaceFrontend,
     'dasheng': HuggingfaceFrontend_Dasheng,
     'beats': LocalFrontend_Beats,
-    'eat': HuggingfaceFrontend_Eat
+    'eat': HuggingfaceFrontend_Eat,
+    'w2vbert': W2vBertFrontend,
+    'hf_wav2vec2': HfWav2Vec2Frontend
 }

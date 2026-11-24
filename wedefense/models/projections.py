@@ -61,6 +61,8 @@ def get_projection(conf):
         projection = MSEp2sgrad(conf['embed_dim'], conf['num_class'])
     elif conf['project_type'] == 'TanhLinear':
         projection = TanhLinear(conf['embed_dim'], conf['num_class'])
+    elif conf['project_type'] == 'softmax_u3xi':
+        projection = Linear_U3XI(conf['embed_dim'], conf['num_class'])
     else:
         projection = Linear(conf['embed_dim'], conf['num_class'])
 
@@ -527,6 +529,28 @@ class Linear(nn.Module):
     def forward(self, input, label):
         out = self.trans(input)
         return out
+
+
+class Linear_U3XI(nn.Module):
+    """
+    The softmax head of `Linear` (same parameter names) for
+    SSL_BACKEND_MHFA_U3XI: the input is cat(embedding, embedding variance)
+    [B, 2 * emb_dim] and the logits are computed from the embedding half.
+    """
+
+    def __init__(self, emb_dim=256, class_num=2):
+        super().__init__()
+        self.emb_dim = emb_dim
+        self.trans = nn.Sequential(nn.BatchNorm1d(emb_dim),
+                                   nn.ReLU(inplace=True),
+                                   nn.Linear(emb_dim, class_num))
+        # state of the U3-xi logit scaling, which is not used: constant,
+        # kept as part of the state dict
+        self.register_buffer('c_ema', torch.tensor(0.5))
+        self.register_buffer('u_ema', torch.tensor(-1.0))
+
+    def forward(self, input, label):
+        return self.trans(input[:, :self.emb_dim])
 
 
 class TanhLinear(nn.Module):

@@ -314,10 +314,37 @@ def Dataset(data_type,
             dataset = Processor(dataset, processor.add_reverb_noise,
                                 reverb_data, noise_data, resample_rate,
                                 aug_prob)
+        # sparse sound events and clipping
+        if configs.get('event_aug', False):
+            dataset = Processor(dataset,
+                                processor.event_aug,
+                                plan_path=configs['event_plan'],
+                                prob=configs.get('event_prob', 0.3),
+                                snr_range=configs.get('event_snr', [6, 18]),
+                                clip_prob=configs.get('event_clip_prob', 0.1),
+                                clip_gain_db=configs.get(
+                                    'event_clip_gain_db', [1, 4]))
         # codec
         codec_flag = configs.get('codec_aug', False)
         if codec_flag:
-            dataset = Processor(dataset, processor.codec)
+            dataset = Processor(dataset,
+                                processor.codec,
+                                random_seed=configs.get('codec_seed', 42),
+                                formats=configs.get('codec_formats', None),
+                                prob=configs.get('codec_prob', 1.0))
+        # band limit / packet loss / pitch / time mask / noise
+        if configs.get('diverse_aug', False):
+            noise_source = LmdbData(noise_lmdb_file) if (
+                noise_lmdb_file
+                and configs.get('diverse_noise', True)) else None
+            dataset = Processor(dataset,
+                                processor.diverse_aug,
+                                prob=configs.get('diverse_prob', 0.5),
+                                n_ops=configs.get('diverse_n_ops', [1, 2]),
+                                noise_source=noise_source,
+                                sample_rate=resample_rate,
+                                noise_snr=configs.get('diverse_noise_snr',
+                                                      [5, 30]))
 
         # compute fbank
         if frontend_type == 'fbank':

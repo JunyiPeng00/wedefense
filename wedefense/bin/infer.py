@@ -36,10 +36,10 @@ def main(model_path,
     print("embedding_scp_path {}".format(embedding_scp_path))
     print("out_path {}".format(out_path))
 
-    utt = []
+    utts = []
     embd = []
     for k, v in kaldiio.load_scp_sequential(embedding_scp_path):
-        utt.append(k)
+        utts.append(k)
         embd.append(v)
     embd = np.vstack(embd)
     print(embd.shape)
@@ -111,12 +111,12 @@ def main(model_path,
     print(out_path)
     with kaldiio.WriteHelper('ark,scp:' + out_path + "/logits.ark," +
                              out_path + "/logits.scp") as writer:
-        for i, utt in enumerate(utt):
+        for i, utt in enumerate(utts):
             writer(utt, output[i])
 
     with kaldiio.WriteHelper('ark,scp:' + out_path + "/posteriors.ark," +
                              out_path + "/posteriors.scp") as writer:
-        for i, utt in enumerate(utt):
+        for i, utt in enumerate(utts):
             writer(utt, softmax(output[i]))
 
 
